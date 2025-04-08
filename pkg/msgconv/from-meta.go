@@ -738,6 +738,7 @@ func (mc *MessageConverter) reuploadAttachment(
 		Info: &event.FileInfo{
 			Size: int(size),
 		},
+		Mentions: &event.Mentions{},
 	}
 	needVoiceConvert := attachmentType == table.AttachmentTypeAudio && ffmpeg.Supported()
 	needMime := mimeType == ""
