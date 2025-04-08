@@ -297,6 +297,34 @@ func wrapMessageDelete(portal networkid.PortalKey, uncertain bool, messageID str
 }
 
 func (m *MetaClient) handleDeleteMessage(tk handlerParams, msg *table.LSDeleteMessage) bridgev2.RemoteEvent {
+	editID := metaid.MakeFBMessageID(msg.MessageId)
+	originalMsg, err := m.Main.Bridge.DB.Message.GetFirstPartByID(tk.ctx, m.UserLogin.ID, editID)
+	if err != nil {
+		zerolog.Ctx(tk.ctx).Err(err).Str("message_id", msg.MessageId).Msg("Failed to get edit target message")
+	} else if originalMsg == nil {
+		zerolog.Ctx(tk.ctx).Warn().Str("message_id", msg.MessageId).Msg("Edit target message not found")
+	}
+
+	evt := &simplevent.Reaction{
+		EventMeta: simplevent.EventMeta{
+			Type: bridgev2.RemoteEventReaction,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.Str("target_message_id", msg.MessageId)
+			},
+			PortalKey:         tk.Portal,
+			UncertainReceiver: tk.UncertainReceiver,
+			Sender: bridgev2.EventSender{
+				IsFromMe:    networkid.UserLoginID(originalMsg.SenderID) == m.UserLogin.ID,
+				SenderLogin: networkid.UserLoginID(originalMsg.SenderID),
+				Sender:      originalMsg.SenderID,
+			},
+		},
+		TargetMessage: metaid.MakeFBMessageID(msg.MessageId),
+		Emoji:         "🚮",
+	}
+
+	return evt
+
 	return wrapMessageDelete(tk.Portal, tk.UncertainReceiver, msg.MessageId)
 }
 

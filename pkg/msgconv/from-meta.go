@@ -403,6 +403,9 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 	switch {
 	case strings.HasPrefix(att.CTA.NativeUrl, "instagram://media/?shortcode="), strings.HasPrefix(att.CTA.NativeUrl, "instagram://reels_share/?shortcode="):
 		actionURL, _ := url.Parse(removeLPHP(att.CTA.ActionUrl))
+
+		minimalConverted.Content.Mentions.Room = false
+
 		var carouselChildMediaID string
 		if actionURL != nil {
 			carouselChildMediaID = actionURL.Query().Get("carousel_share_child_media_id")
@@ -447,6 +450,7 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 				minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "reupload fail"
 				return minimalConverted
 			}
+			secondConverted.Content.Mentions.Room = false
 			secondConverted.Content.Info.ThumbnailInfo = minimalConverted.Content.Info
 			secondConverted.Content.Info.ThumbnailURL = minimalConverted.Content.URL
 			secondConverted.Content.Info.ThumbnailFile = minimalConverted.Content.File
@@ -691,7 +695,7 @@ func (mc *MessageConverter) xmaAttachmentToMatrix(ctx context.Context, att *tabl
 		addExternalURLCaption(converted.Content, externalURL)
 	}
 	parts := []*bridgev2.ConvertedMessagePart{converted}
-	if att.TitleText != "" || att.CaptionBodyText != "" {
+	if false { // att.TitleText != "" || att.CaptionBodyText != "" {
 		captionContent := &event.MessageEventContent{
 			MsgType: event.MsgText,
 		}
