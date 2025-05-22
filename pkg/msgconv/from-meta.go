@@ -89,7 +89,7 @@ func (mc *MessageConverter) ToMatrix(
 	ctx = context.WithValue(ctx, contextKeyIntent, intent)
 	ctx = context.WithValue(ctx, contextKeyPortal, portal)
 	ctx = context.WithValue(ctx, contextKeyFetchXMA, !disableXMA)
-	ctx = context.WithValue(ctx, contextKeyMsgID, messageID)
+	ctx = context.WithValue(ctx, contextKeyMsgID, metaid.MakeFBMessageID(msg.MessageId))
 	cm := &bridgev2.ConvertedMessage{
 		Parts: make([]*bridgev2.ConvertedMessagePart, 0),
 	}
@@ -745,19 +745,6 @@ func (mc *MessageConverter) reuploadAttachment(
 			content.MsgType = event.MsgFile
 		}
 	}
-	fillMetadata := func() {
-		content.Body = fileName
-		content.Info.MimeType = mimeType
-		content.Info.Duration = duration
-		content.Info.Width = width
-		content.Info.Height = height
-
-		if content.Body == "" {
-			content.Body = strings.TrimPrefix(string(content.MsgType), "m.") + exmime.ExtensionFromMimetype(mimeType)
-		} else if content.MsgType != "" && !strings.ContainsRune(content.Body, '.') {
-			content.Body += exmime.ExtensionFromMimetype(mimeType)
-		}
-	}
 
 	if mc.DirectMedia {
 		msgID := ctx.Value(contextKeyMsgID).(networkid.MessageID)
@@ -774,12 +761,9 @@ func (mc *MessageConverter) reuploadAttachment(
 		if err != nil {
 			return nil, err
 		}
-		content.Info.Size = fileSize
-		fillMetadata()
 		return &bridgev2.ConvertedMessagePart{
 			Type:    event.EventMessage,
 			Content: content,
-			Extra:   extra,
 			DBMetadata: &metaid.MessageMetadata{
 				DirectMediaMeta: directMediaMeta,
 			},
@@ -794,7 +778,6 @@ func (mc *MessageConverter) reuploadAttachment(
 		return nil, fmt.Errorf("%w: %w", bridgev2.ErrMediaDownloadFailed, err)
 	}
 	content.Info.Size = int(size)
-	content.Mentions = &event.Mentions{}
 	needVoiceConvert := attachmentType == table.AttachmentTypeAudio && ffmpeg.Supported()
 	needMime := mimeType == ""
 	needImageSize := (attachmentType == table.AttachmentTypeImage || attachmentType == table.AttachmentTypeEphemeralImage) && (width == 0 || height == 0)
@@ -862,7 +845,17 @@ func (mc *MessageConverter) reuploadAttachment(
 	if err != nil {
 		return nil, err
 	}
-	fillMetadata()
+	content.Body = fileName
+	content.Info.MimeType = mimeType
+	content.Info.Duration = duration
+	content.Info.Width = width
+	content.Info.Height = height
+
+	if content.Body == "" {
+		content.Body = strings.TrimPrefix(string(content.MsgType), "m.") + exmime.ExtensionFromMimetype(mimeType)
+	} else if content.MsgType != "" && !strings.ContainsRune(content.Body, '.') {
+		content.Body += exmime.ExtensionFromMimetype(mimeType)
+	}
 	return &bridgev2.ConvertedMessagePart{
 		Type:    eventType,
 		Content: content,
