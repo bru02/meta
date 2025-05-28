@@ -774,6 +774,7 @@ func (mc *MessageConverter) reuploadAttachment(
 		if err != nil {
 			return nil, err
 		}
+		content.Info.Size = fileSize
 		fillMetadata()
 		return &bridgev2.ConvertedMessagePart{
 			Type:    event.EventMessage,
