@@ -103,10 +103,14 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 			ctx, m.Client, msg.Event, msg.Content, msg.ReplyTo, msg.ThreadRoot, otid, msg.OrigSender != nil, msg.Portal,
 		)
 		if errors.Is(err, types.ErrPleaseReloadPage) {
-			// TODO handle properly
+			if m.canReconnect() {
+				go m.FullReconnect()
+			}
 			return nil, err
 		} else if errors.Is(err, messagix.ErrTokenInvalidated) {
-			// TODO handle properly
+			if m.canReconnect() {
+				go m.FullReconnect()
+			}
 			return nil, err
 		} else if err != nil {
 			return nil, fmt.Errorf("failed to convert message: %w", err)
@@ -122,14 +126,17 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 		var resp *table.LSTable
 
 		for retries := 0; retries < 5; retries++ {
-			if err = m.Client.WaitUntilCanSendMessages(15 * time.Second); err != nil {
+			if err = m.Client.WaitUntilCanSendMessages(ctx, 15*time.Second); err != nil {
 				log.Err(err).Msg("Error waiting to be able to send messages, retrying")
 			} else {
-				resp, err = m.Client.ExecuteTasks(tasks...)
+				resp, err = m.Client.ExecuteTasks(ctx, tasks...)
 				if err == nil {
 					break
 				}
 				log.Err(err).Msg("Failed to send message to Meta, retrying")
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
 		}
 		if err != nil {
@@ -254,7 +261,7 @@ func (m *MetaClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Mat
 		if !m.connectWaiter.WaitTimeout(ConnectWaitTimeout) {
 			return nil, ErrNotConnected
 		}
-		resp, err := m.Client.ExecuteTasks(&socket.SendReactionTask{
+		resp, err := m.Client.ExecuteTasks(ctx, &socket.SendReactionTask{
 			ThreadKey:       metaid.ParseFBPortalID(msg.Portal.ID),
 			TimestampMs:     msg.Event.Timestamp,
 			MessageID:       messageID.ID,
@@ -298,7 +305,7 @@ func (m *MetaClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridge
 		if !m.connectWaiter.WaitTimeout(ConnectWaitTimeout) {
 			return ErrNotConnected
 		}
-		resp, err := m.Client.ExecuteTasks(&socket.SendReactionTask{
+		resp, err := m.Client.ExecuteTasks(ctx, &socket.SendReactionTask{
 			ThreadKey:       metaid.ParseFBPortalID(msg.Portal.ID),
 			TimestampMs:     msg.Event.Timestamp,
 			MessageID:       messageID.ID,
@@ -360,7 +367,7 @@ func (m *MetaClient) HandleMatrixEdit(ctx context.Context, edit *bridgev2.Matrix
 		newEditCount := int64(edit.EditTarget.EditCount) + 1
 
 		var resp *table.LSTable
-		resp, err = m.Client.ExecuteTasks(editTask)
+		resp, err = m.Client.ExecuteTasks(ctx, editTask)
 		log.Trace().Any("response", resp).Msg("Meta edit response")
 		if err != nil {
 			return fmt.Errorf("failed to send edit to Meta: %w", err)
@@ -416,7 +423,7 @@ func (m *MetaClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev
 		if !m.connectWaiter.WaitTimeout(ConnectWaitTimeout) {
 			return ErrNotConnected
 		}
-		resp, err := m.Client.ExecuteTasks(&socket.DeleteMessageTask{MessageId: messageID.ID})
+		resp, err := m.Client.ExecuteTasks(ctx, &socket.DeleteMessageTask{MessageId: messageID.ID})
 		// TODO does the response data need to be checked?
 		log.Trace().Any("response", resp).Msg("Meta delete response")
 		return err
@@ -484,7 +491,7 @@ func (m *MetaClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridg
 	if !fbMessageToReadTS.IsZero() && threadID != 0 {
 		var syncGroup int64 = 1
 		// TODO set sync group to 104 for community groups?
-		resp, err := m.Client.ExecuteTasks(&socket.ThreadMarkReadTask{
+		resp, err := m.Client.ExecuteTasks(ctx, &socket.ThreadMarkReadTask{
 			ThreadId:            threadID,
 			LastReadWatermarkTs: fbMessageToReadTS.UnixMilli(),
 			SyncGroup:           syncGroup,
