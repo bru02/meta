@@ -31,8 +31,8 @@ import (
 
 const DPR = "1"
 const BrowserName = "Chrome"
-const ChromeVersion = "136"
-const ChromeVersionFull = ChromeVersion + ".0.7103.48"
+const ChromeVersion = "138"
+const ChromeVersionFull = ChromeVersion + ".0.7204.92"
 const UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + ChromeVersion + ".0.0.0 Safari/537.36"
 const SecCHUserAgent = `"Chromium";v="` + ChromeVersion + `", "Google Chrome";v="` + ChromeVersion + `", "Not-A.Brand";v="99"`
 const SecCHFullVersionList = `"Chromium";v="` + ChromeVersionFull + `", "Google Chrome";v="` + ChromeVersionFull + `", "Not-A.Brand";v="99.0.0.0"`
@@ -136,6 +136,7 @@ type dumpedState struct {
 	SyncStore   map[int64]*socket.QueryMetadata
 	PacketsSent uint16
 	SessionID   int64
+	Timestamp   time.Time
 }
 
 func (c *Client) DumpState() (json.RawMessage, error) {
@@ -147,13 +148,20 @@ func (c *Client) DumpState() (json.RawMessage, error) {
 		SyncStore:   c.syncManager.store,
 		PacketsSent: c.socket.packetsSent,
 		SessionID:   c.socket.sessionID,
+		Timestamp:   time.Now(),
 	})
 }
+
+const MaxCachedStateAge = 24 * time.Hour
+
+var ErrCachedStateTooOld = errors.New("cached state is too old")
 
 func (c *Client) LoadState(state json.RawMessage) error {
 	var dumped dumpedState
 	if err := json.Unmarshal(state, &dumped); err != nil {
 		return err
+	} else if !dumped.Timestamp.IsZero() && time.Since(dumped.Timestamp) > MaxCachedStateAge {
+		return fmt.Errorf("%w (created at %s)", ErrCachedStateTooOld, dumped.Timestamp)
 	}
 
 	c.configs = dumped.Configs

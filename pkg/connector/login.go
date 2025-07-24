@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -153,15 +155,15 @@ func (m *MetaCookieLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 	case types.Facebook, types.FacebookTor:
 		step.CookiesParams.URL = "https://www.facebook.com/"
 		step.CookiesParams.Fields = cookieListToFields(cookies.FBRequiredCookies, "facebook.com")
-		step.CookiesParams.WaitForURLPattern = "^https://www\\.facebook\\.com/(?:messages/(?:e2ee/)?(?:t/[0-9]+/?)?)?$"
+		step.CookiesParams.WaitForURLPattern = "^https://www\\.facebook\\.com/(?:messages/(?:e2ee/)?(?:t/[0-9]+/?)?)?(?:\\?.*)?$"
 	case types.Messenger:
-		step.CookiesParams.URL = "https://www.messenger.com/"
+		step.CookiesParams.URL = "https://www.messenger.com/?no_redirect=true"
 		step.CookiesParams.Fields = cookieListToFields(cookies.FBRequiredCookies, "messenger.com")
-		step.CookiesParams.WaitForURLPattern = "^https://www\\.messenger\\.com/(?:e2ee/)?(?:t/[0-9]+/?)?$"
+		step.CookiesParams.WaitForURLPattern = "^https://www\\.messenger\\.com/(?:e2ee/)?(?:t/[0-9]+/?)?(?:\\?.*)?$"
 	case types.Instagram:
 		step.CookiesParams.URL = "https://www.instagram.com/"
 		step.CookiesParams.Fields = cookieListToFields(cookies.IGRequiredCookies, "instagram.com")
-		step.CookiesParams.WaitForURLPattern = "^https://www\\.instagram\\.com/(?:direct/(?:inbox/|t/[0-9]+/)?)?$"
+		step.CookiesParams.WaitForURLPattern = "^https://www\\.instagram\\.com/(?:direct/(?:inbox/|t/[0-9]+/)?)?(?:\\?.*)?$"
 	default:
 		return nil, fmt.Errorf("unknown mode %s", m.Mode)
 	}
@@ -174,6 +176,7 @@ var (
 	ErrLoginMissingCookies   = bridgev2.RespError{ErrCode: "FI.MAU.META_MISSING_COOKIES", Err: "Missing cookies", StatusCode: http.StatusBadRequest}
 	ErrLoginChallenge        = bridgev2.RespError{ErrCode: "FI.MAU.META_CHALLENGE_ERROR", Err: "Challenge required, please check the official website or app and then try again", StatusCode: http.StatusBadRequest}
 	ErrLoginConsent          = bridgev2.RespError{ErrCode: "FI.MAU.META_CONSENT_ERROR", Err: "Consent required, please check the official website or app and then try again", StatusCode: http.StatusBadRequest}
+	ErrLoginCheckpoint       = bridgev2.RespError{ErrCode: "FI.MAU.META_CHECKPOINT_ERROR", Err: "Checkpoint required, please check the official website or app and then try again", StatusCode: http.StatusBadRequest}
 	ErrLoginTokenInvalidated = bridgev2.RespError{ErrCode: "FI.MAU.META_TOKEN_ERROR", Err: "Got logged out immediately", StatusCode: http.StatusBadRequest}
 	ErrLoginUnknown          = bridgev2.RespError{ErrCode: "M_UNKNOWN", Err: "Internal error logging in", StatusCode: http.StatusInternalServerError}
 )
@@ -196,11 +199,16 @@ func (m *MetaCookieLogin) SubmitCookies(ctx context.Context, strCookies map[stri
 		}
 	}
 
+	log.Debug().
+		Strs("cookie_names", slices.Collect(maps.Keys(strCookies))).
+		Msg("Logging in with cookies")
 	user, tbl, err := client.LoadMessagesPage(ctx)
 	if err != nil {
 		log.Err(err).Msg("Failed to load messages page for login")
 		if errors.Is(err, messagix.ErrChallengeRequired) {
 			return nil, ErrLoginChallenge
+		} else if errors.Is(err, messagix.ErrCheckpointRequired) {
+			return nil, ErrLoginCheckpoint
 		} else if errors.Is(err, messagix.ErrConsentRequired) {
 			return nil, ErrLoginConsent
 		} else if errors.Is(err, messagix.ErrTokenInvalidated) {

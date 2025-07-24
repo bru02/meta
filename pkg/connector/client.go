@@ -228,6 +228,11 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 				StateEvent: status.StateBadCredentials,
 				Error:      IGAccountSuspended,
 			})
+		} else if errors.Is(err, messagix.ErrCheckpointRequired) {
+			m.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateBadCredentials,
+				Error:      FBCheckpointRequired,
+			})
 		} else if errors.Is(err, messagix.ErrConsentRequired) {
 			code := IGConsentRequired
 			if m.LoginMeta.Platform.IsMessenger() {
@@ -252,7 +257,14 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 			if stateEvt == status.StateTransientDisconnect {
 				m.connectWithRetry(retryCtx, ctx, attempts+1)
 			}
-		} else if attempts < MaxConnectRetries {
+		} else if gqlErr := (&types.GraphQLError{}); errors.As(err, &gqlErr) {
+			// TODO determine if this should retry
+			m.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateUnknownError,
+				Error:      MetaGraphQLError,
+				Message:    gqlErr.Message,
+			})
+		} else if attempts < MaxConnectRetries && !errors.Is(err, messagix.ErrVersionIDNotFound) {
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateTransientDisconnect,
 				Error:      MetaConnectError,
@@ -262,6 +274,9 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateUnknownError,
 				Error:      MetaConnectError,
+				Info: map[string]any{
+					"go_error": err.Error(),
+				},
 			})
 		}
 		return
@@ -418,7 +433,7 @@ func (m *MetaClient) connectE2EE() error {
 		m.E2EEClient.SynchronousAck = true
 		m.E2EEClient.EnableDecryptedEventBuffer = true
 	}
-	m.E2EEClient.AddEventHandler(m.e2eeEventHandler)
+	m.E2EEClient.AddEventHandlerWithSuccessStatus(m.e2eeEventHandler)
 	err = m.E2EEClient.Connect()
 	if err != nil {
 		return fmt.Errorf("failed to connect to e2ee socket: %w", err)

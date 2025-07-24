@@ -32,6 +32,7 @@ const (
 	MetaRedirectedToLoginPage  status.BridgeStateErrorCode = "meta-redirected-to-login"
 	MetaNotLoggedIn            status.BridgeStateErrorCode = "meta-not-logged-in"
 	MetaConnectError           status.BridgeStateErrorCode = "meta-connect-error"
+	MetaGraphQLError           status.BridgeStateErrorCode = "meta-graphql-error"
 	MetaTransientDisconnect    status.BridgeStateErrorCode = "meta-transient-disconnect"
 	IGChallengeRequired        status.BridgeStateErrorCode = "ig-challenge-required"
 	IGChallengeRequiredMaybe   status.BridgeStateErrorCode = "ig-challenge-required-maybe"
@@ -39,6 +40,7 @@ const (
 	MetaServerUnavailable      status.BridgeStateErrorCode = "meta-server-unavailable"
 	IGConsentRequired          status.BridgeStateErrorCode = "ig-consent-required"
 	FBConsentRequired          status.BridgeStateErrorCode = "fb-consent-required"
+	FBCheckpointRequired       status.BridgeStateErrorCode = "fb-checkpoint-required"
 	MetaProxyUpdateFail        status.BridgeStateErrorCode = "meta-proxy-update-fail"
 )
 
@@ -56,6 +58,7 @@ func init() {
 		IGChallengeRequiredMaybe:   "Connection refused, please check the Instagram website to continue",
 		IGConsentRequired:          "Consent required, please check the Instagram website to continue",
 		FBConsentRequired:          "Consent required, please check the Facebook website to continue",
+		FBCheckpointRequired:       "Checkpoint required, please check the Facebook website to continue",
 		MetaServerUnavailable:      "Connection refused by server",
 		MetaConnectError:           "Unknown connection error",
 		MetaProxyUpdateFail:        "Failed to update proxy",
@@ -203,7 +206,13 @@ func (m *MetaClient) handleParsedTable(ctx context.Context, isInitial bool, tbl 
 		if ctx.Err() != nil {
 			return
 		}
-		m.UserLogin.QueueRemoteEvent(evt)
+		res := m.UserLogin.QueueRemoteEvent(evt)
+		if !res.Success {
+			zerolog.Ctx(ctx).Warn().
+				Any("queue_result", res).
+				Msg("Queue remote event returned non-success status, cancelling table handling")
+			return
+		}
 	}
 	if !isInitial && ctx.Err() == nil {
 		m.Client.PostHandlePublishResponse(tbl)
