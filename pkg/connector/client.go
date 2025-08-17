@@ -143,6 +143,9 @@ func (m *MetaClient) Connect(ctx context.Context) {
 		return
 	}
 	defer m.connectLock.Unlock()
+	if m.metaState.StateEvent == "" && m.waState.StateEvent == "" {
+		m.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
+	}
 	retryCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if oldCancel := m.stopConnectAttempt.Swap(&cancel); oldCancel != nil {
@@ -289,6 +292,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 }
 
 func (m *MetaClient) connectWithTable(ctx context.Context, initialTable *table.LSTable, currentUser types.UserInfo) {
+	zerolog.Ctx(ctx).Debug().Msg("Loaded messages page, connecting to MQTT with initial table")
 	go m.handleTableLoop(ctx)
 
 	var err error

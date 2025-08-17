@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/go-querystring/query"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exsync"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"golang.org/x/net/proxy"
@@ -77,9 +78,8 @@ type Client struct {
 	unnecessaryCATRequests int
 
 	stopCurrentConnection atomic.Pointer[context.CancelFunc]
-
-	canSendMessages  bool
-	sendMessagesCond *sync.Cond
+	connectionLoopStopped *exsync.Event
+	canSendMessages       *exsync.Event
 }
 
 var DisableTLSVerification = false
@@ -98,16 +98,17 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger) *Client {
 			},
 			Timeout: 60 * time.Second,
 		},
-		cookies:          cookies,
-		Logger:           logger,
-		lsRequests:       0,
-		graphQLRequests:  1,
-		Platform:         cookies.Platform,
-		activeTasks:      make([]int, 0),
-		taskMutex:        &sync.Mutex{},
-		canSendMessages:  false,
-		sendMessagesCond: sync.NewCond(&sync.Mutex{}),
+		cookies:               cookies,
+		Logger:                logger,
+		lsRequests:            0,
+		graphQLRequests:       1,
+		Platform:              cookies.Platform,
+		activeTasks:           make([]int, 0),
+		taskMutex:             &sync.Mutex{},
+		connectionLoopStopped: exsync.NewEvent(),
+		canSendMessages:       exsync.NewEvent(),
 	}
+	cli.connectionLoopStopped.Set()
 	if DisableTLSVerification {
 		cli.http.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
@@ -295,14 +296,20 @@ func (c *Client) Connect(ctx context.Context) error {
 	if oldCancel != nil {
 		(*oldCancel)()
 	}
+	c.connectionLoopStopped.Clear()
 	go func() {
+		defer func() {
+			if c.stopCurrentConnection.Load() == &cancel {
+				c.connectionLoopStopped.Set()
+			}
+		}()
 		connectionAttempts := 1
 		reconnectIn := 2 * time.Second
 		for {
-			c.disableSendingMessages() // In case we're reconnecting from a normal network error
+			c.canSendMessages.Clear() // In case we're reconnecting from a normal network error
 			connectStart := time.Now()
 			err := c.socket.Connect(ctx)
-			c.disableSendingMessages()
+			c.canSendMessages.Clear()
 			if ctx.Err() != nil {
 				zerolog.Ctx(ctx).Warn().
 					Err(ctx.Err()).
@@ -351,6 +358,9 @@ func (c *Client) Disconnect() {
 		(*fn)()
 	}
 	c.socket.Disconnect()
+	if !c.connectionLoopStopped.WaitTimeout(5 * time.Second) {
+		c.Logger.Warn().Msg("Connection loop didn't stop in time")
+	}
 }
 
 func (c *Client) IsConnected() bool {
@@ -477,51 +487,16 @@ func (c *Client) getTaskID() int {
 	return id
 }
 
-func (c *Client) EnableSendingMessages() {
-	if c == nil {
-		return
-	}
-	c.sendMessagesCond.L.Lock()
-	c.canSendMessages = true
-	c.sendMessagesCond.Broadcast()
-	c.sendMessagesCond.L.Unlock()
-}
-
-func (c *Client) disableSendingMessages() {
-	if c == nil {
-		return
-	}
-	c.sendMessagesCond.L.Lock()
-	c.canSendMessages = false
-	c.sendMessagesCond.L.Unlock()
-}
-
 func (c *Client) WaitUntilCanSendMessages(ctx context.Context, timeout time.Duration) error {
 	if c == nil {
 		return ErrClientIsNil
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	done := make(chan struct{})
-	go func() {
-		c.sendMessagesCond.L.Lock()
-		defer c.sendMessagesCond.L.Unlock()
-		c.sendMessagesCond.Wait()
-		close(done)
-	}()
-
-	for !c.canSendMessages {
-		select {
-		case <-timer.C:
-			return fmt.Errorf("timeout waiting for canSendMessages")
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			if c.canSendMessages {
-				return nil
-			}
-		}
+	select {
+	case <-time.After(timeout):
+		return fmt.Errorf("timeout waiting for canSendMessages")
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.canSendMessages.GetChan():
+		return nil
 	}
-	return nil
 }

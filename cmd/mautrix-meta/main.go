@@ -23,7 +23,7 @@ var m = mxmain.BridgeMain{
 	Name:        "mautrix-meta",
 	URL:         "https://github.com/mautrix/meta",
 	Description: "A Matrix-Meta puppeting bridge.",
-	Version:     "0.5.2",
+	Version:     "0.5.3",
 	Connector:   c,
 }
 
@@ -48,8 +48,8 @@ func main() {
 	}
 	m.PostStart = func() {
 		if m.Matrix.Provisioning != nil {
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/login", legacyProvLogin)
-			m.Matrix.Provisioning.Router.HandleFunc("/v1/logout", legacyProvLogout)
+			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/login", legacyProvLogin)
+			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/logout", legacyProvLogout)
 		}
 	}
 	m.InitVersion(Tag, Commit, BuildTime)
