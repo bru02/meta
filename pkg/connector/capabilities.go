@@ -18,7 +18,6 @@ package connector
 
 import (
 	"context"
-	"maps"
 	"time"
 
 	"go.mau.fi/util/ffmpeg"
@@ -33,8 +32,21 @@ import (
 )
 
 var metaGeneralCaps = &bridgev2.NetworkGeneralCapabilities{
-	DisappearingMessages: false,
+	DisappearingMessages: true,
 	AggressiveUpdateInfo: false,
+	ImplicitReadReceipts: true,
+	Provisioning: bridgev2.ProvisioningCapabilities{
+		ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
+			CreateDM: true,
+			Search:   true,
+		},
+		GroupCreation: map[string]bridgev2.GroupTypeCapabilities{
+			"group": {
+				TypeDescription: "a group",
+				Participants:    bridgev2.GroupFieldCapability{Allowed: true, Required: true, MinLength: 2, MaxLength: 250},
+			},
+		},
+	},
 }
 
 func (m *MetaConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
@@ -42,7 +54,7 @@ func (m *MetaConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 }
 
 func (m *MetaConnector) GetBridgeInfoVersion() (info, caps int) {
-	return 1, 7
+	return 1, 9
 }
 
 const MaxTextLength = 20000
@@ -58,7 +70,7 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 func capID() string {
-	base := "fi.mau.meta.capabilities.2025_04_21"
+	base := "fi.mau.meta.capabilities.2025_10_06"
 	if ffmpeg.Supported() {
 		return base + "+ffmpeg"
 	}
@@ -136,16 +148,17 @@ var metaCaps = &event.RoomFeatures{
 			MaxSize: MaxFileSize,
 		},
 	},
-	MaxTextLength: MaxTextLength,
-	Reply:         event.CapLevelFullySupported,
-	Edit:          event.CapLevelFullySupported,
-	EditMaxCount:  10,
-	EditMaxAge:    ptr.Ptr(jsontime.S(24 * time.Hour)),
-	Delete:        event.CapLevelFullySupported,
-	DeleteForMe:   false,
-	DeleteMaxAge:  ptr.Ptr(jsontime.S(10 * time.Minute)),
-	Reaction:      event.CapLevelFullySupported,
-	ReactionCount: 1,
+	MaxTextLength:       MaxTextLength,
+	Reply:               event.CapLevelFullySupported,
+	Edit:                event.CapLevelFullySupported,
+	EditMaxCount:        10,
+	EditMaxAge:          ptr.Ptr(jsontime.S(24 * time.Hour)),
+	Delete:              event.CapLevelFullySupported,
+	DeleteForMe:         false,
+	DeleteMaxAge:        ptr.Ptr(jsontime.S(10 * time.Minute)),
+	Reaction:            event.CapLevelFullySupported,
+	ReactionCount:       1,
+	TypingNotifications: true,
 	//LocationMessage: event.CapLevelPartialSupport,
 }
 
@@ -154,29 +167,26 @@ var metaCapsWithE2E *event.RoomFeatures
 var igCaps *event.RoomFeatures
 
 func init() {
-	metaCapsWithThreads = ptr.Clone(metaCaps)
+	metaCapsWithThreads = metaCaps.Clone()
 	metaCapsWithThreads.ID += "+communitygroup"
 	metaCapsWithThreads.Thread = event.CapLevelFullySupported
+	metaCapsWithThreads.TypingNotifications = false
 
-	metaCapsWithE2E = ptr.Clone(metaCaps)
+	metaCapsWithE2E = metaCaps.Clone()
 	metaCapsWithE2E.ID += "+e2e"
-	metaCapsWithE2E.File = maps.Clone(metaCapsWithE2E.File)
-	for key, value := range metaCapsWithE2E.File {
-		metaCapsWithE2E.File[key] = ptr.Clone(value)
-		metaCapsWithE2E.File[key].MaxSize = MaxFileSizeWithE2E
+	for _, value := range metaCapsWithE2E.File {
+		value.MaxSize = MaxFileSizeWithE2E
 		// Messenger Web doesn't render captions on images in e2ee chats 3:<
 		// (works fine on Messenger iOS and Android though)
-		metaCapsWithE2E.File[key].Caption = event.CapLevelDropped
+		value.Caption = event.CapLevelDropped
 	}
 	delete(metaCapsWithE2E.File[event.MsgVideo].MimeTypes, "video/webm")
 	delete(metaCapsWithE2E.File[event.MsgVideo].MimeTypes, "video/ogg")
 
-	igCaps = ptr.Clone(metaCaps)
-	igCaps.File = maps.Clone(igCaps.File)
+	igCaps = metaCaps.Clone()
 	delete(igCaps.File, event.MsgFile)
-	for key, value := range igCaps.File {
-		igCaps.File[key] = ptr.Clone(value)
-		igCaps.File[key].Caption = event.CapLevelDropped
+	for _, value := range igCaps.File {
+		value.Caption = event.CapLevelDropped
 	}
 	igCaps.ID += "+instagram-p2"
 }
@@ -188,7 +198,7 @@ func (m *MetaClient) GetCapabilities(ctx context.Context, portal *bridgev2.Porta
 	case table.ENCRYPTED_OVER_WA_ONE_TO_ONE, table.ENCRYPTED_OVER_WA_GROUP:
 		return metaCapsWithE2E
 	}
-	if (m.Client != nil && m.Client.Platform == types.Instagram) || m.Main.Config.Mode == types.Instagram {
+	if m.Client.GetPlatform() == types.Instagram || m.Main.Config.Mode == types.Instagram {
 		return igCaps
 	}
 	return metaCaps

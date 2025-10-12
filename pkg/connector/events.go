@@ -20,6 +20,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -166,7 +167,11 @@ func (evt *FBMessageEvent) GetStreamOrder() int64 {
 }
 
 func (evt *FBMessageEvent) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
-	return evt.m.Main.MsgConv.ToMatrix(ctx, portal, evt.m.Client, intent, evt.GetID(), evt.WrappedMessage, evt.m.Main.Config.DisableXMAAlways), nil
+	cli := evt.m.Client
+	if cli == nil {
+		return nil, messagix.ErrClientIsNil
+	}
+	return evt.m.Main.MsgConv.ToMatrix(ctx, portal, cli, intent, evt.GetID(), evt.WrappedMessage, evt.m.Main.Config.DisableXMAAlways), nil
 }
 
 type FBEditEvent struct {
@@ -291,6 +296,9 @@ var (
 )
 
 func (evt *WAMessageEvent) GetTargetMessage() networkid.MessageID {
+	if evt.Message == nil {
+		return ""
+	}
 	consumerApp, ok := evt.Message.(*waConsumerApplication.ConsumerApplication)
 	if !ok {
 		//payload, ok := evt.Message.(*instamadilloSupplementMessage.SupplementMessagePayload)
@@ -446,6 +454,9 @@ func (evt *WAMessageEvent) GetType() bridgev2.RemoteEventType {
 	case *instamadilloDeleteMessage.DeleteMessagePayload:
 		return bridgev2.RemoteEventMessageRemove
 	default:
+		if evt.Message == nil && evt.FBApplication.GetMetadata().GetChatEphemeralSetting() != nil {
+			return bridgev2.RemoteEventMessage
+		}
 		log.Warn().Type("message_type", evt.Message).Msg("Unrecognized message type")
 	}
 	return bridgev2.RemoteEventUnknown

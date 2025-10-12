@@ -58,6 +58,17 @@ type MetaClient struct {
 
 	metaState status.BridgeState
 	waState   status.BridgeState
+
+	waLastPresence   waTypes.Presence
+	igThreadIDs      map[string]int64
+	igUserIDs        map[string]int64
+	igUserIDsReverse map[int64]string
+}
+
+func (m *MetaConnector) getMessagixConfig() *messagix.Config {
+	return &messagix.Config{
+		MayConnectToDGW: m.Config.ReceiveInstagramTypingIndicators,
+	}
 }
 
 func (m *MetaConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
@@ -65,7 +76,7 @@ func (m *MetaConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserL
 	var messagixClient *messagix.Client
 	if loginMetadata.Cookies != nil {
 		loginMetadata.Cookies.Platform = loginMetadata.Platform
-		messagixClient = messagix.NewClient(loginMetadata.Cookies, login.Log.With().Str("component", "messagix").Logger())
+		messagixClient = messagix.NewClient(loginMetadata.Cookies, login.Log.With().Str("component", "messagix").Logger(), m.getMessagixConfig())
 	}
 	c := &MetaClient{
 		Main:      m,
@@ -80,6 +91,9 @@ func (m *MetaConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserL
 
 		connectWaiter:     exsync.NewEvent(),
 		e2eeConnectWaiter: exsync.NewEvent(),
+		igThreadIDs:       map[string]int64{},
+		igUserIDs:         map[string]int64{},
+		igUserIDsReverse:  map[int64]string{},
 	}
 	if messagixClient != nil {
 		messagixClient.SetEventHandler(c.handleMetaEvent)
@@ -157,7 +171,8 @@ func (m *MetaClient) Connect(ctx context.Context) {
 const MaxConnectRetries = 10
 
 func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts int) {
-	if m.Client == nil {
+	cli := m.Client
+	if cli == nil {
 		m.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      MetaNotLoggedIn,
@@ -178,7 +193,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 	} else if state != nil {
 		if !m.Main.Config.CacheConnectionState {
 			zerolog.Ctx(ctx).Debug().Msg("Not using saved reconnection state as it's disabled in the config")
-		} else if err = m.Client.LoadState(state); err != nil {
+		} else if err = cli.LoadState(state); err != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to load reconnection state")
 		} else {
 			zerolog.Ctx(ctx).Debug().Msg("Reconnecting with cached state")
@@ -189,8 +204,8 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 		zerolog.Ctx(ctx).Debug().Msg("No saved reconnection state")
 	}
 	if m.Main.Config.GetProxyFrom != "" || m.Main.Config.Proxy != "" {
-		m.Client.GetNewProxy = m.Main.getProxy
-		if !m.Client.UpdateProxy("connect") {
+		cli.GetNewProxy = m.Main.getProxy
+		if !cli.UpdateProxy("connect") {
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateUnknownError,
 				Error:      MetaProxyUpdateFail,
@@ -198,7 +213,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 			return
 		}
 	}
-	currentUser, initialTable, err := m.Client.LoadMessagesPage(ctx)
+	currentUser, initialTable, err := cli.LoadMessagesPage(ctx)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to load messages page")
 		if stopPeriodicReconnect := m.stopPeriodicReconnect.Swap(nil); stopPeriodicReconnect != nil {
@@ -225,6 +240,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      IGChallengeRequired,
+				UserAction: status.UserActionRestart,
 			})
 		} else if errors.Is(err, messagix.ErrAccountSuspended) {
 			m.UserLogin.BridgeState.Send(status.BridgeState{
@@ -235,6 +251,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      FBCheckpointRequired,
+				UserAction: status.UserActionRestart,
 			})
 		} else if errors.Is(err, messagix.ErrConsentRequired) {
 			code := IGConsentRequired
@@ -244,6 +261,7 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      code,
+				UserAction: status.UserActionRestart,
 			})
 		} else if lsErr := (&types.ErrorResponse{}); errors.As(err, &lsErr) {
 			stateEvt := status.StateUnknownError
@@ -522,7 +540,7 @@ func (m *MetaClient) FullReconnect() {
 	m.connectWaiter.Clear()
 	m.e2eeConnectWaiter.Clear()
 	m.disconnect(false)
-	m.Client = messagix.NewClient(m.LoginMeta.Cookies, m.UserLogin.Log.With().Str("component", "messagix").Logger())
+	m.Client = messagix.NewClient(m.LoginMeta.Cookies, m.UserLogin.Log.With().Str("component", "messagix").Logger(), m.Main.getMessagixConfig())
 	m.Client.SetEventHandler(m.handleMetaEvent)
 	m.Connect(ctx)
 	m.lastFullReconnect = time.Now()
@@ -534,7 +552,7 @@ func (m *MetaClient) resetWADevice() {
 }
 
 func (m *MetaClient) FillBridgeState(state status.BridgeState) status.BridgeState {
-	if state.StateEvent == status.StateConnected {
+	if state.StateEvent == status.StateConnected || state.Error == WADisconnected {
 		var copyFrom *status.BridgeState
 		if m.waState.StateEvent != "" && m.waState.StateEvent != status.StateConnected {
 			copyFrom = &m.waState
@@ -557,4 +575,12 @@ func (m *MetaClient) FillBridgeState(state status.BridgeState) status.BridgeStat
 		state.Info["login_user_agent"] = m.LoginMeta.LoginUA
 	}
 	return state
+}
+
+func (m *MetaClient) updateWAPresence(presence waTypes.Presence) error {
+	err := m.E2EEClient.SendPresence(presence)
+	if err == nil {
+		m.waLastPresence = presence
+	}
+	return err
 }

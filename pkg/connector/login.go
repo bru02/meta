@@ -16,6 +16,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
+	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 )
 
@@ -148,7 +149,7 @@ func (m *MetaCookieLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error
 		StepID:       LoginStepIDCookies,
 		Instructions: "Enter a JSON object with your cookies, or a cURL command copied from browser devtools.",
 		CookiesParams: &bridgev2.LoginCookiesParams{
-			UserAgent: messagix.UserAgent,
+			UserAgent: useragent.UserAgent,
 		},
 	}
 	switch m.Mode {
@@ -191,7 +192,7 @@ func (m *MetaCookieLogin) SubmitCookies(ctx context.Context, strCookies map[stri
 	}
 
 	log := m.User.Log.With().Str("component", "messagix").Logger()
-	client := messagix.NewClient(c, log)
+	client := messagix.NewClient(c, log, m.Main.getMessagixConfig())
 	if m.Main.Config.GetProxyFrom != "" || m.Main.Config.Proxy != "" {
 		client.GetNewProxy = m.Main.getProxy
 		if !client.UpdateProxy("login") {
