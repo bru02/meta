@@ -2,10 +2,10 @@ module go.mau.fi/mautrix-meta
 
 go 1.24.0
 
-toolchain go1.25.1
+toolchain go1.25.4
 
 require (
-	github.com/gabriel-vasile/mimetype v1.4.10
+	github.com/gabriel-vasile/mimetype v1.4.11
 	github.com/google/go-querystring v1.1.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.0
@@ -13,16 +13,16 @@ require (
 	github.com/rs/zerolog v1.34.0
 	github.com/tidwall/gjson v1.18.0
 	github.com/zyedidia/clipboard v1.0.4
-	go.mau.fi/libsignal v0.2.1-0.20251004173110-6e0a3f2435ed
-	go.mau.fi/util v0.9.2-0.20251001114608-d99877b9cc10
-	go.mau.fi/whatsmeow v0.0.0-20251005090451-fb1caa3db194
-	golang.org/x/crypto v0.42.0
-	golang.org/x/exp v0.0.0-20250911091902-df9299821621
-	golang.org/x/image v0.31.0
-	golang.org/x/net v0.44.0
+	go.mau.fi/libsignal v0.2.1
+	go.mau.fi/util v0.9.3
+	go.mau.fi/whatsmeow v0.0.0-20251116104239-3aca43070cd4
+	golang.org/x/crypto v0.44.0
+	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6
+	golang.org/x/image v0.33.0
+	golang.org/x/net v0.47.0
 	google.golang.org/protobuf v1.36.10
 	gopkg.in/yaml.v3 v3.0.1
-	maunium.net/go/mautrix v0.25.2-0.20251006140546-548970fd0f3d
+	maunium.net/go/mautrix v0.26.0
 )
 
 require (
@@ -43,9 +43,9 @@ require (
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
 	github.com/yuin/goldmark v1.7.13 // indirect
 	go.mau.fi/zeroconfig v0.2.0 // indirect
-	golang.org/x/sync v0.17.0 // indirect
-	golang.org/x/sys v0.36.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/sync v0.18.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
