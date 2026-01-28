@@ -82,9 +82,6 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		log.Debug().Msg("Initial connect to Meta socket completed")
 		m.connectWaiter.Set()
 		if m.LoginMeta.Platform.IsMessenger() || m.Main.Config.IGE2EE {
-			if m.waState.StateEvent == "" {
-				m.waState.StateEvent = status.StateConnecting
-			}
 			m.firstE2EEConnectDone = true
 			go m.tryConnectE2EE(false)
 		}
@@ -94,8 +91,15 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 			log.Debug().Msg("Handling cached initial table")
 			m.parseAndQueueTable(ctx, tbl, true)
 		}
+		// Start thread backfill in background after initial sync
+		go func() {
+			if err := m.StartThreadBackfill(ctx); err != nil {
+				log.Err(err).Msg("Thread backfill failed")
+			}
+		}()
 	case *messagix.Event_SocketError:
 		log.Debug().Err(evt.Err).Msg("Disconnected from Meta socket")
+		m.connectWaiter.Clear()
 		m.metaState = status.BridgeState{
 			StateEvent: status.StateTransientDisconnect,
 			Error:      MetaTransientDisconnect,
@@ -103,9 +107,6 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		m.UserLogin.BridgeState.Send(m.metaState)
 	case *messagix.Event_Reconnected:
 		if !m.firstE2EEConnectDone && (m.LoginMeta.Platform.IsMessenger() || m.Main.Config.IGE2EE) {
-			if m.waState.StateEvent == "" {
-				m.waState.StateEvent = status.StateConnecting
-			}
 			m.firstE2EEConnectDone = true
 			go m.tryConnectE2EE(false)
 		}
@@ -120,16 +121,16 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 				Error:      MetaConnectionUnauthorized,
 			}
 		} else if errors.Is(evt.Err, messagix.CONNECTION_REFUSED_SERVER_UNAVAILABLE) {
-			if m.Main.Config.Mode.IsMessenger() {
-				m.metaState = status.BridgeState{
-					StateEvent: status.StateUnknownError,
-					Error:      MetaServerUnavailable,
-				}
-				if m.canReconnect() {
-					log.Debug().Msg("Doing full reconnect after server unavailable error")
-					go m.FullReconnect()
-				}
-			} else {
+			m.metaState = status.BridgeState{
+				StateEvent: status.StateUnknownError,
+				Error:      MetaServerUnavailable,
+			}
+			if m.canReconnect() {
+				log.Debug().Msg("Doing full reconnect after server unavailable error")
+				go m.FullReconnect()
+			} else if !m.Main.Config.Mode.IsMessenger() {
+				// Instagram server unavailables have historically been more likely to be bad credentials,
+				// so default to that if we reconnected too recently.
 				m.metaState = status.BridgeState{
 					StateEvent: status.StateBadCredentials,
 					Error:      IGChallengeRequiredMaybe,
@@ -427,6 +428,11 @@ func (m *MetaClient) handleMarkThreadRead(tk handlerParams, msg *table.LSMarkThr
 }
 
 func (m *MetaClient) handleUpdateReadReceipt(tk handlerParams, msg *table.LSUpdateReadReceipt) bridgev2.RemoteEvent {
+	// Only set timestamp if Instagram provides a valid one
+	var timestamp time.Time
+	if msg.ReadActionTimestampMs > 0 {
+		timestamp = time.UnixMilli(msg.ReadActionTimestampMs)
+	}
 	return &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type: bridgev2.RemoteEventReadReceipt,
@@ -436,7 +442,7 @@ func (m *MetaClient) handleUpdateReadReceipt(tk handlerParams, msg *table.LSUpda
 			PortalKey:         tk.Portal,
 			UncertainReceiver: tk.UncertainReceiver,
 			Sender:            m.makeEventSender(msg.ContactId),
-			Timestamp:         time.UnixMilli(msg.ReadActionTimestampMs),
+			Timestamp:         timestamp,
 		},
 		ReadUpTo: time.UnixMilli(msg.ReadWatermarkTimestampMs),
 	}
@@ -722,11 +728,21 @@ func (m *MetaClient) handleEdit(ctx context.Context, edit *table.LSEditMessage, 
 	} else if originalMsg == nil {
 		zerolog.Ctx(ctx).Warn().Str("message_id", edit.MessageID).Msg("Edit target message not found")
 	} else {
-		*innerQueue = append(*innerQueue, &FBEditEvent{
+		editEv := &FBEditEvent{
 			LSEditMessage: edit,
 			orig:          originalMsg,
 			m:             m,
-		})
+		}
+		*innerQueue = append(*innerQueue, editEv)
+		if ch, ok := m.editChannels.Get(editEv.MessageID); ok {
+			select {
+			case ch <- editEv:
+				return
+			default:
+				zerolog.Ctx(ctx).Warn().Msg("Dropped LSEditMessage from channel due to internal error")
+				return
+			}
+		}
 	}
 }
 

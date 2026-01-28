@@ -16,3 +16,7 @@ const SecCHModel = `""`
 const SecCHPrefersColorScheme = "light"
 
 const AndroidUserAgent = "Instagram 404.0.0.48.76 Android (35/15; 420dpi; 1080x2400; Google/google; Pixel 7; panther; panther; en_US; 813748018)"
+
+const MessengerLiteAppId = "437626316973788"
+const MessengerLiteAccessToken = MessengerLiteAppId + "|3e1a7033ae7883bfb31f35375bad9c7a"
+const MessengerLiteUserAgent = "LightSpeed [FBAN/MessengerLiteForiOS;FBAV/545.0.0.12.108;FBBV/865730320;FBDV/iPhone10,3;FBMD/iPhone;FBSN/iOS;FBSV/16.7.2;FBSS/3;FBCR/;FBID/phone;FBLC/en_US;FBOP/0]"

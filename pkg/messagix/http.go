@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -30,7 +29,7 @@ type HttpQuery struct {
 	S                    string `url:"__s,omitempty"`         // not required
 	Hsi                  string `url:"__hsi,omitempty"`       // not required
 	Dyn                  string `url:"__dyn,omitempty"`       // not required
-	Csr                  string `url:"__csr"`                 // not required
+	Csr                  string `url:"__csr,omitempty"`       // not required
 	CometReq             string `url:"__comet_req,omitempty"` // not required but idk what this is
 	FbDtsg               string `url:"fb_dtsg,omitempty"`
 	Jazoest              string `url:"jazoest,omitempty"`                  // not required
@@ -57,6 +56,21 @@ type HttpQuery struct {
 	RouteURL              string `url:"route_url,omitempty"`                // not required
 	RoutingNamespace      string `url:"routing_namespace,omitempty"`        // not required
 	Crn                   string `url:"__crn,omitempty"`                    // not required
+
+	// The following keys are used for Messenger Lite:
+
+	Method string `url:"method,omitempty"`
+	Pretty string `url:"pretty,omitempty"` // "true" or "false"
+	Format string `url:"format,omitempty"`
+	// ServerTimestamps
+	Locale  string `url:"locale,omitempty"`
+	Purpose string `url:"purpose,omitempty"`
+	// FbAPIReqFriendlyName
+	ClientDocID                                 string `url:"client_doc_id,omitempty"`
+	EnableCanonicalNaming                       string `url:"enable_canonical_naming,omitempty"`                          // "true" or "false"
+	EnableCanonicalVariableOverrides            string `url:"enable_canonical_variable_overrides,omitempty"`              // "true" or "false"
+	EnableCanonicalNamingAmbiguousTypePrefixing string `url:"enable_canonical_naming_ambiguous_type_prefixing,omitempty"` // "true" or "false"
+	// Variables
 }
 
 func (c *Client) newHTTPQuery() *HttpQuery {
@@ -107,6 +121,7 @@ var (
 	ErrAccountSuspended         = errors.New("account suspended")
 	ErrRequestFailed            = errors.New("failed to send request")
 	ErrResponseReadFailed       = errors.New("failed to read response body")
+	ErrServerError              = errors.New("server returned 5xx error")
 	ErrMaxRetriesReached        = errors.New("maximum retries reached")
 	ErrTooManyRedirects         = errors.New("too many redirects")
 	ErrVersionIDNotFound        = errors.New("version ID not found")
@@ -229,6 +244,10 @@ func (c *Client) makeRequestDirect(ctx context.Context, url string, method strin
 		return nil, nil, fmt.Errorf("%w: %w", ErrResponseReadFailed, err)
 	}
 
+	if response.StatusCode >= 500 {
+		return nil, nil, fmt.Errorf("%w: %d", ErrServerError, response.StatusCode)
+	}
+
 	return response, responseBody, nil
 }
 
@@ -270,6 +289,25 @@ func (c *Client) buildHeaders(withCookies, isSecFetchDocument bool) http.Header 
 	return headers
 }
 
+func (c *Client) buildMessengerLiteHeaders() (http.Header, error) {
+
+	analHdr, err := makeRequestAnalyticsHeader()
+	if err != nil {
+		return nil, err
+	}
+
+	// This isn't from a browser, so we don't include most of the usual headers
+	headers := http.Header{}
+	headers.Set("user-agent", useragent.MessengerLiteUserAgent)
+	headers.Set("x-fb-http-engine", "Tigon+iOS")
+	headers.Set("accept", "*/*")
+	headers.Set("priority", "u=3, i")
+	headers.Set("accept-language", "en-US,en;q=0.9")
+	headers.Set("x-fb-request-analytics-tags", analHdr)
+
+	return headers, nil
+}
+
 func (c *Client) addFacebookHeaders(h *http.Header) {
 	if c.configs != nil && c.configs.LSDToken != "" {
 		h.Set("x-fb-lsd", c.configs.LSDToken)
@@ -293,56 +331,4 @@ func (c *Client) addInstagramHeaders(h *http.Header) {
 			h.Set("x-ig-app-id", c.configs.BrowserConfigTable.CurrentUserInitialData.AppID)
 		}
 	}
-}
-
-func (c *Client) findCookie(cookies []*http.Cookie, name string) *http.Cookie {
-	for _, c := range cookies {
-		if c.Name == name {
-			return c
-		}
-	}
-	return nil
-}
-
-func (c *Client) sendLoginRequest(ctx context.Context, form url.Values, loginUrl string) (*http.Response, []byte, error) {
-	h := c.buildLoginHeaders()
-	loginPayload := []byte(form.Encode())
-
-	resp, respBody, err := c.MakeRequest(ctx, loginUrl, "POST", h, loginPayload, types.FORM)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to send login request: %w", err)
-	}
-
-	return resp, respBody, nil
-}
-
-func (c *Client) buildLoginHeaders() http.Header {
-	h := c.buildHeaders(true, false)
-	if c.Platform.IsMessenger() {
-		h = c.addLoginFacebookHeaders(h)
-	} else {
-		h = c.addLoginInstagramHeaders(h)
-	}
-	h.Set("origin", c.GetEndpoint("base_url"))
-	h.Set("referer", c.GetEndpoint("login_page"))
-
-	return h
-}
-
-func (c *Client) addLoginFacebookHeaders(h http.Header) http.Header {
-	h.Set("sec-fetch-dest", "document")
-	h.Set("sec-fetch-mode", "navigate")
-	h.Set("sec-fetch-site", "same-origin") // header is required
-	h.Set("sec-fetch-user", "?1")
-	h.Set("upgrade-insecure-requests", "1")
-	return h
-}
-
-func (c *Client) addLoginInstagramHeaders(h http.Header) http.Header {
-	h.Set("x-instagram-ajax", strconv.FormatInt(c.configs.BrowserConfigTable.SiteData.ServerRevision, 10))
-	h.Set("sec-fetch-dest", "empty")
-	h.Set("sec-fetch-mode", "cors")
-	h.Set("sec-fetch-site", "same-origin") // header is required
-	h.Set("x-requested-with", "XMLHttpRequest")
-	return h
 }

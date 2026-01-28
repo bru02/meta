@@ -48,7 +48,6 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/data/responses"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
-	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
 )
 
@@ -76,6 +75,17 @@ func (mc *MessageConverter) getBasicUserInfo(ctx context.Context, user networkid
 	return ghost.Intent.GetMXID(), ghost.Name, nil
 }
 
+// The fake stickers that are sent when someone presses the thumbs-up
+// button in Messenger. They are handled specially by the Messenger
+// web client instead of being displayed as normal stickers. There are
+// three variants depending on how long the sending user held down the
+// send button.
+const (
+	facebookThumbsUpSmallStickerID  = 369239263222822
+	facebookThumbsUpMediumStickerID = 369239343222814
+	facebookThumbsUpLargeStickerID  = 369239383222810
+)
+
 func (mc *MessageConverter) ToMatrix(
 	ctx context.Context,
 	portal *bridgev2.Portal,
@@ -96,17 +106,54 @@ func (mc *MessageConverter) ToMatrix(
 	if msg.IsUnsent {
 		return cm
 	}
+	// Display the thumbs-up sticker as a simple emoji message,
+	// which is the same way that it is displayed for encrypted
+	// chats, to be consistent between the two types of chats.
+	switch msg.StickerId {
+	case facebookThumbsUpLargeStickerID, facebookThumbsUpMediumStickerID, facebookThumbsUpSmallStickerID:
+		if len(msg.Stickers) == 1 {
+			msg.Text = "👍"
+			msg.Stickers = nil
+		}
+	}
+	// Keep track of any part IDs that are important and must be
+	// kept the same in order for the message to render correctly.
+	// We have to ensure that these part IDs are not overwritten
+	// by later code.
+	importantPartIDs := []networkid.PartID{}
+	seenBlobFBIDs := map[string]bool{}
 	for i, blobAtt := range msg.BlobAttachments {
-		ctx := context.WithValue(ctx, contextKeyPartID, networkid.PartID(fmt.Sprintf("blob_attachment_%d", i)))
-		cm.Parts = append(cm.Parts, mc.blobAttachmentToMatrix(ctx, blobAtt))
+		// Sometimes Facebook literally sends two exact copies
+		// of LSInsertBlobAttachment, byte for byte identical,
+		// for the same media, one right after the other. This
+		// in particular seems to happen with the initial
+		// Lightspeed table if the latest message in a thread
+		// in your inbox happens to be a media. Detect this
+		// and don't include two copies of the media. Note: if
+		// you literally attach the exact same image to your
+		// message twice, it shows up as different fbids in
+		// LSInsertBlobAttachment, so that use case won't be
+		// affected by this check.
+		if blobAtt.AttachmentFbid != "" && seenBlobFBIDs[blobAtt.AttachmentFbid] {
+			continue
+		} else {
+			seenBlobFBIDs[blobAtt.AttachmentFbid] = true
+		}
+		partID := networkid.PartID(fmt.Sprintf("blob_attachment_%d", i))
+		ctx := context.WithValue(ctx, contextKeyPartID, partID)
+		cm.Parts = append(cm.Parts, mc.blobAttachmentToMatrix(ctx, blobAtt, i))
+		importantPartIDs = append(importantPartIDs, partID)
 	}
 	for i, legacyAtt := range msg.Attachments {
-		ctx := context.WithValue(ctx, contextKeyPartID, networkid.PartID(fmt.Sprintf("attachment_%d", i)))
-		cm.Parts = append(cm.Parts, mc.legacyAttachmentToMatrix(ctx, legacyAtt))
+		partID := networkid.PartID(fmt.Sprintf("attachment_%d", i))
+		ctx := context.WithValue(ctx, contextKeyPartID, partID)
+		cm.Parts = append(cm.Parts, mc.legacyAttachmentToMatrix(ctx, legacyAtt, i))
+		importantPartIDs = append(importantPartIDs, partID)
 	}
 	var urlPreviews []*table.WrappedXMA
 	for i, xmaAtt := range msg.XMAAttachments {
-		ctx := context.WithValue(ctx, contextKeyPartID, networkid.PartID(fmt.Sprintf("xma_attachment_%d", i)))
+		partID := networkid.PartID(fmt.Sprintf("xma_attachment_%d", i))
+		ctx := context.WithValue(ctx, contextKeyPartID, partID)
 		if isProbablyURLPreview(xmaAtt) {
 			// URL previews are handled in the text section
 			urlPreviews = append(urlPreviews, xmaAtt)
@@ -116,10 +163,13 @@ func (mc *MessageConverter) ToMatrix(
 			continue
 		}
 		cm.Parts = append(cm.Parts, mc.xmaAttachmentToMatrix(ctx, xmaAtt)...)
+		importantPartIDs = append(importantPartIDs, partID)
 	}
 	for i, sticker := range msg.Stickers {
-		ctx := context.WithValue(ctx, contextKeyPartID, networkid.PartID(fmt.Sprintf("sticker_%d", i)))
+		partID := networkid.PartID(fmt.Sprintf("sticker_%d", i))
+		ctx := context.WithValue(ctx, contextKeyPartID, partID)
 		cm.Parts = append(cm.Parts, mc.stickerToMatrix(ctx, sticker))
+		importantPartIDs = append(importantPartIDs, partID)
 	}
 	hasRelationSnippet := msg.ReplySnippet != "" && len(msg.XMAAttachments) > 0 && len(msg.XMAAttachments) != len(urlPreviews)
 	if msg.Text != "" || hasRelationSnippet || len(urlPreviews) > 0 {
@@ -137,9 +187,11 @@ func (mc *MessageConverter) ToMatrix(
 			content.BeeperLinkPreviews = make([]*event.BeeperLinkPreview, len(urlPreviews))
 			previewLinks := make([]string, len(urlPreviews))
 			for i, preview := range urlPreviews {
-				ctx := context.WithValue(ctx, contextKeyPartID, networkid.PartID(fmt.Sprintf("beeper_link_preview_%d", i)))
+				partID := networkid.PartID(fmt.Sprintf("beeper_link_preview_%d", i))
+				ctx := context.WithValue(ctx, contextKeyPartID, partID)
 				content.BeeperLinkPreviews[i] = mc.urlPreviewToBeeper(ctx, preview)
 				previewLinks[i] = content.BeeperLinkPreviews[i].CanonicalURL
+				importantPartIDs = append(importantPartIDs, partID)
 			}
 			// TODO do more fancy detection of whether the link is in the body?
 			if len(content.Body) == 0 {
@@ -177,6 +229,12 @@ func (mc *MessageConverter) ToMatrix(
 			Type:    event.EventMessage,
 			Content: content,
 			Extra:   extra,
+			// These duplicate information about people joining and leaving a room,
+			// which would generally be rendered already by a Matrix client. There may
+			// be other "admin" messages that are important, but there is no structured
+			// data from Meta about what kind of message it is, so we can't really tell.
+			// Drop them all for now.
+			DontBridge: msg.IsAdminMessage,
 		})
 	}
 	if len(cm.Parts) == 0 {
@@ -215,14 +273,13 @@ func (mc *MessageConverter) ToMatrix(
 		unsupported, _ := part.Extra["fi.mau.unsupported"].(bool)
 		if unsupported && !hasExternalURL {
 			var threadURL, protocolName string
-			switch client.GetPlatform() {
-			case types.Instagram:
+			if client.GetPlatform().IsInstagram() {
 				threadURL = fmt.Sprintf("https://www.instagram.com/direct/t/%s/", portal.ID)
 				protocolName = "Instagram"
-			case types.Facebook, types.FacebookTor:
+			} else if client.GetPlatform().IsViaFacebook() {
 				threadURL = fmt.Sprintf("https://www.facebook.com/messages/t/%s/", portal.ID)
 				protocolName = "Facebook"
-			case types.Messenger:
+			} else if client.GetPlatform().IsViaMessenger() {
 				threadURL = fmt.Sprintf("https://www.messenger.com/t/%s/", portal.ID)
 				protocolName = "Messenger"
 			}
@@ -235,7 +292,14 @@ func (mc *MessageConverter) ToMatrix(
 			part.Content.Mentions = &event.Mentions{}
 		}
 	}
-	cm.MergeCaption()
+
+	if cm.MergeCaption() {
+		// The MergeCaption method only does something if there are exactly two
+		// parts in the message, and we don't add text parts to the "important"
+		// slice, so we are safe to assume that if it returns true, then there is
+		// exactly one item in the slice and it is the media part ID.
+		cm.Parts[0].ID = importantPartIDs[0]
+	}
 	return cm
 }
 
@@ -258,7 +322,7 @@ func errorToNotice(err error, attachmentContainerType string) *bridgev2.Converte
 	}
 }
 
-func (mc *MessageConverter) blobAttachmentToMatrix(ctx context.Context, att *table.LSInsertBlobAttachment) *bridgev2.ConvertedMessagePart {
+func (mc *MessageConverter) blobAttachmentToMatrix(ctx context.Context, att *table.LSInsertBlobAttachment, partIndex int) *bridgev2.ConvertedMessagePart {
 	url := att.PlayableUrl
 	mime := att.PlayableUrlMimeType
 	if mime == "" {
@@ -266,13 +330,23 @@ func (mc *MessageConverter) blobAttachmentToMatrix(ctx context.Context, att *tab
 	}
 	duration := att.PlayableDurationMs
 	var width, height int64
+	expiresAt := att.PlayableUrlExpirationTimestampMs
 	if url == "" {
 		url = att.PreviewUrl
 		mime = att.PreviewUrlMimeType
 		width, height = att.PreviewWidth, att.PreviewHeight
+		expiresAt = att.PreviewUrlExpirationTimestampMs
 	}
+
+	refreshMeta := &MediaRefreshMeta{
+		ExpiresAt:      expiresAt,
+		AttachmentFbid: att.AttachmentFbid,
+		PartIndex:      partIndex,
+	}
+
 	converted, err := mc.reuploadAttachment(
 		ctx, att.AttachmentType, url, att.Filename, mime, int(att.Filesize), int(width), int(height), int(duration),
+		refreshMeta,
 	)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to transfer blob media")
@@ -281,7 +355,25 @@ func (mc *MessageConverter) blobAttachmentToMatrix(ctx context.Context, att *tab
 	return converted
 }
 
-func (mc *MessageConverter) legacyAttachmentToMatrix(ctx context.Context, att *table.LSInsertAttachment) *bridgev2.ConvertedMessagePart {
+func (mc *MessageConverter) legacyAttachmentToMatrix(ctx context.Context, att *table.LSInsertAttachment, partIndex int) *bridgev2.ConvertedMessagePart {
+	if mc.DisableViewOnce && (att.EphemeralMediaViewMode == table.EphemeralMediaViewOnce || att.EphemeralMediaViewMode == table.EphemeralMediaReplayable) {
+		mediaType := "photo"
+		viewed := "viewed"
+		if att.EphemeralMediaViewMode == table.EphemeralMediaReplayable {
+			viewed = "replayed"
+		}
+		if att.AttachmentType == table.AttachmentTypeEphemeralVideo {
+			mediaType = "video"
+		}
+		body := fmt.Sprintf("This %s can only be %s once. Use the Instagram mobile app to view.", mediaType, viewed)
+		return &bridgev2.ConvertedMessagePart{
+			Type: event.EventMessage,
+			Content: &event.MessageEventContent{
+				MsgType: event.MsgNotice,
+				Body:    body,
+			},
+		}
+	}
 	url := att.PlayableUrl
 	mime := att.PlayableUrlMimeType
 	if mime == "" {
@@ -289,13 +381,23 @@ func (mc *MessageConverter) legacyAttachmentToMatrix(ctx context.Context, att *t
 	}
 	duration := att.PlayableDurationMs
 	var width, height int64
+	expiresAt := att.PlayableUrlExpirationTimestampMs
 	if url == "" {
 		url = att.PreviewUrl
 		mime = att.PreviewUrlMimeType
 		width, height = att.PreviewWidth, att.PreviewHeight
+		expiresAt = att.PreviewUrlExpirationTimestampMs
 	}
+
+	refreshMeta := &MediaRefreshMeta{
+		ExpiresAt:      expiresAt,
+		AttachmentFbid: att.AttachmentFbid,
+		PartIndex:      partIndex,
+	}
+
 	converted, err := mc.reuploadAttachment(
 		ctx, att.AttachmentType, url, att.Filename, mime, int(att.Filesize), int(width), int(height), int(duration),
+		refreshMeta,
 	)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to transfer media")
@@ -304,17 +406,23 @@ func (mc *MessageConverter) legacyAttachmentToMatrix(ctx context.Context, att *t
 	return converted
 }
 
+// All stickers are rendered in the Messenger web client as 96x96
+// pixels no matter what. For example you'll have a 240x240 pixel
+// sticker image, and the PreviewWidth attribute says it's 128x128,
+// nonetheless it's displayed at 96x96 like everything else.
+const stickerSize = 96
+
 func (mc *MessageConverter) stickerToMatrix(ctx context.Context, att *table.LSInsertStickerAttachment) *bridgev2.ConvertedMessagePart {
 	url := att.PlayableUrl
 	mime := att.PlayableUrlMimeType
-	var width, height int64
 	if url == "" {
 		url = att.PreviewUrl
 		mime = att.PreviewUrlMimeType
-		width, height = att.PreviewWidth, att.PreviewHeight
 	}
+	// Stickers don't typically expire, so no refresh metadata needed
 	converted, err := mc.reuploadAttachment(
-		ctx, table.AttachmentTypeSticker, url, att.AccessibilitySummaryText, mime, 0, int(width), int(height), 0,
+		ctx, table.AttachmentTypeSticker, url, att.AccessibilitySummaryText, mime, 0, stickerSize, stickerSize, 0,
+		nil,
 	)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to transfer sticker media")
@@ -323,7 +431,7 @@ func (mc *MessageConverter) stickerToMatrix(ctx context.Context, att *table.LSIn
 	return converted
 }
 
-func (mc *MessageConverter) instagramFetchedMediaToMatrix(ctx context.Context, att *table.WrappedXMA, resp *responses.Items) (*bridgev2.ConvertedMessagePart, error) {
+func (mc *MessageConverter) instagramFetchedMediaToMatrix(ctx context.Context, att *table.WrappedXMA, resp *responses.Items, xmaRefresh *MediaRefreshMeta) (*bridgev2.ConvertedMessagePart, error) {
 	var url, mime string
 	var width, height int
 	var found bool
@@ -347,8 +455,10 @@ func (mc *MessageConverter) instagramFetchedMediaToMatrix(ctx context.Context, a
 			}
 		}
 	}
+
 	return mc.reuploadAttachment(
 		ctx, att.AttachmentType, url, att.Filename, mime, int(att.Filesize), width, height, int(resp.VideoDuration*1000),
+		xmaRefresh,
 	)
 }
 
@@ -448,7 +558,11 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 					}
 				}
 			}
-			secondConverted, err := mc.instagramFetchedMediaToMatrix(ctx, att, targetItem)
+			xmaRefresh := &MediaRefreshMeta{
+				XMATargetID:  att.CTA.TargetId,
+				XMAShortcode: mediaShortcode,
+			}
+			secondConverted, err := mc.instagramFetchedMediaToMatrix(ctx, att, targetItem, xmaRefresh)
 			if err != nil {
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to transfer fetched media")
 				minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "reupload fail"
@@ -462,6 +576,7 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 			secondConverted.Extra["com.beeper.instagram_item_username"] = targetItem.User.Username
 			if externalURL != "" {
 				secondConverted.Extra["external_url"] = externalURL
+				addExternalURLCaption(secondConverted.Content, externalURL)
 			}
 			secondConverted.Extra["fi.mau.meta.xma_fetch_status"] = "success"
 			return secondConverted
@@ -476,20 +591,22 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 			externalURL = fmt.Sprintf("https://www.instagram.com/stories/%s/%s/", att.HeaderTitle, match[1])
 		}
 		minimalConverted.Extra["external_url"] = externalURL
-		addExternalURLCaption(minimalConverted.Content, externalURL)
 		if !mc.ShouldFetchXMA(ctx) {
 			log.Debug().Msg("Not fetching XMA media")
 			minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "skip"
+			addExternalURLCaption(minimalConverted.Content, externalURL)
 			return minimalConverted
 		}
 
 		if len(match) != 3 {
 			log.Warn().Str("action_url", att.CTA.ActionUrl).Msg("Failed to parse story action URL")
 			minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "parse fail"
+			addExternalURLCaption(minimalConverted.Content, externalURL)
 			return minimalConverted
 		} else if resp, err := ig.FetchReel(ctx, []string{match[2]}, match[1]); err != nil {
 			log.Err(err).Str("action_url", att.CTA.ActionUrl).Msg("Failed to fetch XMA story")
 			minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "fetch fail"
+			addExternalURLCaption(minimalConverted.Content, externalURL)
 			return minimalConverted
 		} else if reel, ok := resp.Reels[match[2]]; !ok {
 			log.Trace().
@@ -503,6 +620,7 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 				Str("response_status", resp.Status).
 				Msg("Got empty XMA story response")
 			minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "empty response"
+			addExternalURLCaption(minimalConverted.Content, externalURL)
 			return minimalConverted
 		} else {
 			log.Trace().
@@ -515,6 +633,7 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 			// Update external URL to use username so it works on mobile
 			externalURL = fmt.Sprintf("https://www.instagram.com/stories/%s/%s/", reel.User.Username, match[1])
 			minimalConverted.Extra["external_url"] = externalURL
+			addExternalURLCaption(minimalConverted.Content, externalURL)
 			var relevantItem *responses.Items
 			foundIDs := make([]string, len(reel.Items))
 			for i, item := range reel.Items {
@@ -534,7 +653,11 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 				return minimalConverted
 			}
 			log.Debug().Msg("Fetched XMA story and found exact item")
-			secondConverted, err := mc.instagramFetchedMediaToMatrix(ctx, att, relevantItem)
+			xmaRefresh := &MediaRefreshMeta{
+				StoryMediaID: match[1],
+				StoryReelID:  match[2],
+			}
+			secondConverted, err := mc.instagramFetchedMediaToMatrix(ctx, att, relevantItem, xmaRefresh)
 			if err != nil {
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to transfer fetched media")
 				minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "reupload fail"
@@ -548,6 +671,7 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 			secondConverted.Extra["com.beeper.instagram_item_username"] = reel.User.Username
 			if externalURL != "" {
 				secondConverted.Extra["external_url"] = externalURL
+				addExternalURLCaption(secondConverted.Content, externalURL)
 			}
 			secondConverted.Extra["fi.mau.meta.xma_fetch_status"] = "success"
 			return secondConverted
@@ -596,7 +720,10 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 				Msg("Fetched XMA story (type 2)")
 			minimalConverted.Extra["com.beeper.instagram_item_username"] = relevantItem.User.Username
 			log.Debug().Int("item_count", len(resp.Items)).Msg("Fetched XMA story (type 2)")
-			secondConverted, err := mc.instagramFetchedMediaToMatrix(ctx, att, relevantItem)
+			xmaRefresh := &MediaRefreshMeta{
+				StoryMediaID: match[2],
+			}
+			secondConverted, err := mc.instagramFetchedMediaToMatrix(ctx, att, relevantItem, xmaRefresh)
 			if err != nil {
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to transfer fetched media")
 				minimalConverted.Extra["fi.mau.meta.xma_fetch_status"] = "reupload fail"
@@ -610,6 +737,7 @@ func (mc *MessageConverter) fetchFullXMA(ctx context.Context, att *table.Wrapped
 			secondConverted.Extra["com.beeper.instagram_item_username"] = relevantItem.User.Username
 			if externalURL != "" {
 				secondConverted.Extra["external_url"] = externalURL
+				addExternalURLCaption(secondConverted.Content, externalURL)
 			}
 			secondConverted.Extra["fi.mau.meta.xma_fetch_status"] = "success"
 			return secondConverted
@@ -657,8 +785,10 @@ func (mc *MessageConverter) urlPreviewToBeeper(ctx context.Context, att *table.W
 		},
 	}
 	if att.PreviewUrl != "" {
+		// URL previews don't typically need refresh metadata
 		converted, err := mc.reuploadAttachment(
 			ctx, att.AttachmentType, att.PreviewUrl, "preview", att.PreviewUrlMimeType, 0, int(att.PreviewWidth), int(att.PreviewHeight), 0,
+			nil,
 		)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to reupload URL preview image")
@@ -692,8 +822,10 @@ func (mc *MessageConverter) xmaAttachmentToMatrix(ctx context.Context, att *tabl
 	if att.ShouldAutoplayVideo {
 		att.AttachmentType = table.AttachmentTypeAnimatedImage
 	}
+	// This is minimal conversion; fetchFullXMA will enhance with proper refresh metadata
 	converted, err := mc.reuploadAttachment(
 		ctx, att.AttachmentType, url, att.Filename, mime, int(att.Filesize), int(width), int(height), 0,
+		nil,
 	)
 	if err == ErrURLNotFound && att.TitleText != "" {
 		return []*bridgev2.ConvertedMessagePart{{
@@ -723,10 +855,24 @@ func (mc *MessageConverter) xmaAttachmentToMatrix(ctx context.Context, att *tabl
 	return parts
 }
 
+// MediaRefreshMeta contains identifiers needed to refresh expired media URLs
+type MediaRefreshMeta struct {
+	ExpiresAt      int64  // Unix ms timestamp when URL expires
+	AttachmentFbid string // For blob attachments
+	PartIndex      int    // For blob attachments (fallback matching)
+	XMATargetID    int64  // For XMA attachments (Instagram API)
+	XMAShortcode   string // For XMA attachments (Instagram API)
+
+	// For XMA story attachments (pre-parsed from action URL):
+	StoryMediaID string // story pk
+	StoryReelID  string // user pk (for /stories/direct/ type)
+}
+
 func (mc *MessageConverter) reuploadAttachment(
 	ctx context.Context, attachmentType table.AttachmentType,
 	url, fileName, mimeType string,
 	fileSize, width, height, duration int,
+	refreshMeta *MediaRefreshMeta,
 ) (*bridgev2.ConvertedMessagePart, error) {
 	if url == "" {
 		return nil, ErrURLNotFound
@@ -759,6 +905,11 @@ func (mc *MessageConverter) reuploadAttachment(
 			content.MsgType = event.MsgFile
 		case table.AttachmentTypeAudio:
 			content.MsgType = event.MsgAudio
+			content.MSC3245Voice = &event.MSC3245Voice{}
+			content.MSC1767Audio = &event.MSC1767Audio{
+				Duration: duration,
+				Waveform: []int{},
+			}
 		default:
 			switch strings.Split(mimeType, "/")[0] {
 			case "image":
@@ -796,10 +947,20 @@ func (mc *MessageConverter) reuploadAttachment(
 		if err != nil {
 			return nil, err
 		}
-		directMediaMeta, err := json.Marshal(DirectMediaMeta{
+		dmm := DirectMediaMeta{
 			MimeType: mimeType,
 			URL:      url,
-		})
+		}
+		if refreshMeta != nil {
+			dmm.ExpiresAt = refreshMeta.ExpiresAt
+			dmm.AttachmentFbid = refreshMeta.AttachmentFbid
+			dmm.PartIndex = refreshMeta.PartIndex
+			dmm.XMATargetID = refreshMeta.XMATargetID
+			dmm.XMAShortcode = refreshMeta.XMAShortcode
+			dmm.StoryMediaID = refreshMeta.StoryMediaID
+			dmm.StoryReelID = refreshMeta.StoryReelID
+		}
+		directMediaMeta, err := json.Marshal(dmm)
 		if err != nil {
 			return nil, err
 		}
@@ -866,11 +1027,6 @@ func (mc *MessageConverter) reuploadAttachment(
 			}
 			fileName += ".ogg"
 			mimeType = "audio/ogg"
-			content.MSC3245Voice = &event.MSC3245Voice{}
-			content.MSC1767Audio = &event.MSC1767Audio{
-				Duration: duration,
-				Waveform: []int{},
-			}
 		} else if needImageSize {
 			destRS := dest.(io.ReadSeeker)
 			_, err = destRS.Seek(0, io.SeekStart)

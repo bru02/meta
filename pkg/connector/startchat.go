@@ -43,6 +43,7 @@ func (m *MetaClient) ResolveIdentifier(ctx context.Context, identifier string, c
 
 	var chat *bridgev2.CreateChatResponse
 	if createChat {
+		tableType := table.ONE_TO_ONE
 		resp, err := m.Client.ExecuteTasks(ctx, &socket.CreateThreadTask{
 			ThreadFBID:                id,
 			ForceUpsert:               0,
@@ -51,11 +52,17 @@ func (m *MetaClient) ResolveIdentifier(ctx context.Context, identifier string, c
 			MetadataOnly:              0,
 			PreviewOnly:               0,
 		})
-
 		log.Debug().Any("response_data", resp).Err(err).Msg("Create chat response")
+		if m.LoginMeta.Platform.IsMessenger() {
+			tableType = table.ENCRYPTED_OVER_WA_ONE_TO_ONE
+			err = m.CreateWhatsAppDM(ctx, id)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to create WhatsApp DM")
+			}
+		}
 		chat = &bridgev2.CreateChatResponse{
-			PortalKey:  m.makeFBPortalKey(id, table.ONE_TO_ONE),
-			PortalInfo: m.makeMinimalChatInfo(id, table.ONE_TO_ONE),
+			PortalKey:  m.makeFBPortalKey(id, tableType),
+			PortalInfo: m.makeMinimalChatInfo(id, tableType),
 		}
 	}
 	ghost, _ := m.Main.Bridge.GetGhostByID(ctx, metaid.MakeUserID(id))
@@ -113,10 +120,10 @@ func (m *MetaClient) CreateGroup(ctx context.Context, params *bridgev2.GroupCrea
 			zerolog.Ctx(ctx).Warn().Err(err).Msg("New group chat portal wasn't created automatically")
 		}
 	}
-	// TODO fetch or generate info?
 	return &bridgev2.CreateChatResponse{
-		PortalKey: portal.PortalKey,
-		Portal:    portal,
+		PortalKey:  portal.PortalKey,
+		Portal:     portal,
+		PortalInfo: m.makeMinimalChatInfo(realThreadID, table.GROUP_THREAD),
 	}, nil
 }
 

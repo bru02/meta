@@ -15,8 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/go-querystring/query"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/exsync"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
@@ -37,15 +37,19 @@ type EventHandler func(ctx context.Context, evt any)
 
 type Config struct {
 	MayConnectToDGW bool
+	ClientSettings  exhttp.ClientSettings
 }
 
 type Client struct {
-	Instagram *InstagramMethods
-	Facebook  *FacebookMethods
-	Logger    zerolog.Logger
-	Platform  types.Platform
+	Instagram     *InstagramMethods
+	Facebook      *FacebookMethods
+	MessengerLite *MessengerLiteMethods
+	Logger        zerolog.Logger
+	Platform      types.Platform
 
 	http         *http.Client
+	httpSettings exhttp.ClientSettings
+	proxyAddr    string
 	socket       *Socket
 	dgwSocket    *dgw.Socket
 	eventHandler EventHandler
@@ -75,21 +79,13 @@ type Client struct {
 }
 
 var DisableTLSVerification = false
+var MaxConnectBackoff = 5 * time.Minute
 
 func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Client {
 	if cookies.Platform == types.Unset {
 		panic("messagix: platform must be set in cookies")
 	}
 	cli := &Client{
-		http: &http.Client{
-			Transport: &http.Transport{
-				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 40 * time.Second,
-				ForceAttemptHTTP2:     true,
-			},
-			Timeout: 60 * time.Second,
-		},
 		cookies:               cookies,
 		Logger:                logger,
 		lsRequests:            0,
@@ -100,6 +96,7 @@ func NewClient(cookies *cookies.Cookies, logger zerolog.Logger, cfg *Config) *Cl
 		connectionLoopStopped: exsync.NewEvent(),
 		canSendMessages:       exsync.NewEvent(),
 	}
+	cli.SetHTTP(cfg.ClientSettings)
 	cli.connectionLoopStopped.Set()
 	if DisableTLSVerification {
 		cli.http.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
@@ -180,7 +177,7 @@ func (c *Client) LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.L
 	if c == nil {
 		return nil, nil, ErrClientIsNil
 	} else if !c.cookies.IsLoggedIn() {
-		return nil, nil, fmt.Errorf("can't load messages page without being authenticated")
+		return nil, nil, ErrTokenInvalidated
 	}
 
 	moduleLoader := &ModuleParser{client: c, LS: &table.LSTable{}}
@@ -203,12 +200,6 @@ func (c *Client) LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.L
 	return currentUser, ls, nil
 }
 
-func (c *Client) loadLoginPage(ctx context.Context) *ModuleParser {
-	moduleLoader := &ModuleParser{client: c}
-	moduleLoader.Load(ctx, c.GetEndpoint("login_page"))
-	return moduleLoader
-}
-
 func (c *Client) GetPlatform() types.Platform {
 	if c == nil {
 		return types.Unset
@@ -228,6 +219,9 @@ func (c *Client) configurePlatformClient() {
 	case types.Messenger:
 		selectedEndpoints = endpoints.MessengerEndpoints
 		c.Facebook = &FacebookMethods{client: c}
+	case types.MessengerLite:
+		selectedEndpoints = endpoints.MessengerLiteEndpoints
+		c.MessengerLite = &MessengerLiteMethods{client: c}
 	case types.Instagram:
 		selectedEndpoints = endpoints.InstagramEndpoints
 		c.Instagram = &InstagramMethods{client: c}
@@ -247,15 +241,15 @@ func (c *Client) SetProxy(proxyAddr string) error {
 
 	if proxyParsed.Scheme == "http" || proxyParsed.Scheme == "https" {
 		c.httpProxy = http.ProxyURL(proxyParsed)
-		c.http.Transport.(*http.Transport).Proxy = c.httpProxy
+		c.proxyAddr = proxyAddr
 	} else if proxyParsed.Scheme == "socks5" {
 		c.socksProxy, err = proxy.FromURL(proxyParsed, &net.Dialer{Timeout: 20 * time.Second})
 		if err != nil {
 			return err
 		}
-		contextDialer := c.socksProxy.(proxy.ContextDialer)
-		c.http.Transport.(*http.Transport).DialContext = contextDialer.DialContext
+		c.proxyAddr = proxyAddr
 	}
+	c.SetHTTP(c.httpSettings)
 
 	c.Logger.Debug().
 		Str("scheme", proxyParsed.Scheme).
@@ -274,6 +268,22 @@ func (c *Client) SetEventHandler(handler EventHandler) {
 func (c *Client) HandleEvent(ctx context.Context, evt any) {
 	if c.eventHandler != nil {
 		c.eventHandler(ctx, evt)
+	}
+}
+
+func (c *Client) SetHTTP(settings exhttp.ClientSettings) {
+	if c == nil {
+		return
+	}
+	c.httpSettings = settings.WithGlobalTimeout(60 * time.Second)
+	if c.proxyAddr != "" {
+		c.httpSettings, _ = c.httpSettings.WithProxy(c.proxyAddr)
+	}
+	oldHTTP := c.http
+	c.http = c.httpSettings.Compile()
+	c.http.CheckRedirect = c.checkHTTPRedirect
+	if oldHTTP != nil {
+		oldHTTP.CloseIdleConnections()
 	}
 }
 
@@ -310,7 +320,7 @@ func (c *Client) Connect(ctx context.Context) error {
 			}
 		}()
 		connectionAttempts := 1
-		reconnectIn := 2 * time.Second
+		var reconnectIn time.Duration
 		for {
 			c.canSendMessages.Clear() // In case we're reconnecting from a normal network error
 			connectStart := time.Now()
@@ -324,20 +334,28 @@ func (c *Client) Connect(ctx context.Context) error {
 				return
 			}
 			if errors.Is(err, CONNECTION_REFUSED_UNAUTHORIZED) ||
-				errors.Is(err, CONNECTION_REFUSED_BAD_USERNAME_OR_PASSWORD) ||
 				// TODO server unavailable may mean a challenge state, should be checked somehow
 				errors.Is(err, CONNECTION_REFUSED_SERVER_UNAVAILABLE) {
 				c.HandleEvent(ctx, &Event_PermanentError{Err: err})
 				return
+			} else if errors.Is(err, CONNECTION_REFUSED_BAD_USERNAME_OR_PASSWORD) && connectionAttempts > 5 {
+				// Allow up to 5 reconnects for this error as it does not seem permanent
+				c.HandleEvent(ctx, &Event_PermanentError{Err: err})
+				return
 			}
-			connectionAttempts += 1
 			c.HandleEvent(ctx, &Event_SocketError{Err: err, ConnectionAttempts: connectionAttempts})
-			if time.Since(connectStart) > 2*time.Minute {
-				reconnectIn = 2 * time.Second
+			if time.Since(connectStart) > 2*time.Minute && (err == nil || errors.Is(err, socket.ErrInReadLoop)) {
+				// Reconnect immediately after a long successful connection
+				reconnectIn = 0
+				connectionAttempts = 0
 			} else {
+				if reconnectIn == 0 {
+					reconnectIn = 1 * time.Second
+				}
+				connectionAttempts += 1
 				reconnectIn *= 2
-				if reconnectIn > 5*time.Minute {
-					reconnectIn = 5 * time.Minute
+				if reconnectIn > MaxConnectBackoff {
+					reconnectIn = MaxConnectBackoff
 				}
 			}
 			if err != nil {
@@ -371,8 +389,8 @@ func (c *Client) connectDGW(ctx context.Context) error {
 			reconnectIn = 2 * time.Second
 		} else {
 			reconnectIn *= 2
-			if reconnectIn > 5*time.Minute {
-				reconnectIn = 5 * time.Minute
+			if reconnectIn > MaxConnectBackoff {
+				reconnectIn = MaxConnectBackoff
 			}
 		}
 		if err != nil {
@@ -419,72 +437,6 @@ func (c *Client) Disconnect() {
 
 func (c *Client) IsConnected() bool {
 	return c != nil && c.socket.conn != nil
-}
-
-func (c *Client) sendCookieConsent(ctx context.Context, jsDatr string) error {
-
-	var payloadQuery interface{}
-	h := c.buildHeaders(false, false)
-	h.Set("sec-fetch-dest", "empty")
-	h.Set("sec-fetch-mode", "cors")
-
-	if c.Platform.IsMessenger() {
-		h.Set("sec-fetch-site", "same-origin") // header is required
-		h.Set("sec-fetch-user", "?1")
-		h.Set("host", c.GetEndpoint("host"))
-		h.Set("upgrade-insecure-requests", "1")
-		h.Set("origin", c.GetEndpoint("base_url"))
-		h.Set("cookie", "_js_datr="+jsDatr)
-		h.Set("referer", c.GetEndpoint("login_page"))
-		q := c.newHTTPQuery()
-		q.AcceptOnlyEssential = "false"
-		payloadQuery = q
-	} else {
-		h.Set("sec-fetch-site", "same-site") // header is required
-		h.Set("host", c.GetEndpoint("host"))
-		h.Set("origin", c.GetEndpoint("base_url"))
-		h.Set("referer", c.GetEndpoint("base_url")+"/")
-		h.Set("x-instagram-ajax", strconv.FormatInt(c.configs.BrowserConfigTable.SiteData.ServerRevision, 10))
-		variables, err := json.Marshal(&types.InstagramCookiesVariables{
-			FirstPartyTrackingOptIn: true,
-			IgDid:                   c.cookies.Get("ig_did"),
-			ThirdPartyTrackingOptIn: true,
-			Input: struct {
-				ClientMutationID int `json:"client_mutation_id,omitempty"`
-			}{0},
-		})
-		h.Del("x-csrftoken")
-		if err != nil {
-			return fmt.Errorf("failed to marshal *types.InstagramCookiesVariables into bytes: %w", err)
-		}
-		q := &HttpQuery{
-			DocID:     "3810865872362889",
-			Variables: string(variables),
-		}
-		payloadQuery = q
-	}
-
-	form, err := query.Values(payloadQuery)
-	if err != nil {
-		return err
-	}
-
-	payload := []byte(form.Encode())
-	req, _, err := c.MakeRequest(ctx, c.GetEndpoint("cookie_consent"), "POST", h, payload, types.FORM)
-	if err != nil {
-		return err
-	}
-
-	if c.Platform.IsMessenger() {
-		datr := c.findCookie(req.Cookies(), "datr")
-		if datr == nil {
-			return fmt.Errorf("consenting to facebook cookies failed, could not find datr cookie in set-cookie header")
-		}
-
-		c.cookies.Set(cookies.MetaCookieDatr, datr.Value)
-		c.cookies.Set(cookies.FBCookieWindowDimensions, "1920x1003")
-	}
-	return nil
 }
 
 func (c *Client) GetEndpoint(name string) string {
@@ -557,4 +509,48 @@ func (c *Client) WaitUntilCanSendMessages(ctx context.Context, timeout time.Dura
 
 func (c *Client) GetLogger() *zerolog.Logger {
 	return &c.Logger
+}
+
+func (c *Client) ForceReconnect() {
+	if c == nil {
+		return
+	}
+	c.socket.Disconnect()
+	c.dgwSocket.Disconnect()
+}
+
+func (c *Client) FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error) {
+	if c == nil {
+		return nil, nil, ErrClientIsNil
+	}
+	keyStore := c.syncManager.getSyncGroupKeyStore(syncGroup)
+	if keyStore == nil || !keyStore.HasMoreBefore {
+		return nil, nil, nil // No more threads
+	}
+
+	tskm := c.newTaskManager()
+	tskm.AddNewTask(&socket.FetchThreadsTask{
+		IsAfter:                    0,
+		ParentThreadKey:            keyStore.ParentThreadKey,
+		ReferenceThreadKey:         keyStore.MinThreadKey,
+		ReferenceActivityTimestamp: keyStore.MinLastActivityTimestampMs,
+		AdditionalPagesToFetch:     0,
+		Cursor:                     c.syncManager.GetCursor(syncGroup),
+		SyncGroup:                  int(syncGroup),
+	})
+
+	payload, err := tskm.FinalizePayload()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resp, err := c.socket.makeLSRequest(ctx, payload, 3)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resp.Finish()
+	c.socket.postHandlePublishResponse(resp.Table)
+
+	return keyStore, resp.Table, nil
 }

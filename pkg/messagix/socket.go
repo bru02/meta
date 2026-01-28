@@ -17,12 +17,12 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exhttp"
 	"golang.org/x/net/proxy"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/packets"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
-	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 )
 
@@ -31,12 +31,6 @@ var (
 	protocolClientId = "mqttwsclient"
 	protocolLevel    = 3
 	keepAliveTimeout = 15
-	connectionTypes  = map[types.Platform]string{
-		types.Instagram:   "cookie_auth",
-		types.Facebook:    "websocket",
-		types.Messenger:   "websocket",
-		types.FacebookTor: "websocket",
-	}
 
 	//lint:ignore U1000 - alternatives for minimal*Sync
 	igReconnectSync = []int64{1, 2, 16}
@@ -51,19 +45,6 @@ var (
 	minimalInitialSync     = []int64{1}
 	minimalFBInitialSync   = []int64{1, 104}
 	minimalFBReconnectSync = []int64{1, 2, 104}
-
-	initialSync = map[types.Platform][]int64{
-		types.Instagram:   minimalInitialSync,   // igInitialSync,
-		types.Facebook:    minimalFBInitialSync, // fbInitialSync,
-		types.Messenger:   minimalFBInitialSync, // fbInitialSync,
-		types.FacebookTor: minimalFBInitialSync, // fbInitialSync,
-	}
-	reconnectSync = map[types.Platform][]int64{
-		types.Instagram:   minimalReconnectSync,   // igReconnectSync,
-		types.Facebook:    minimalFBReconnectSync, // fbReconnectSync,
-		types.Messenger:   minimalFBReconnectSync, // fbReconnectSync,
-		types.FacebookTor: minimalFBReconnectSync, // fbReconnectSync,
-	}
 
 	shouldRecurseDatabase = map[int64]bool{
 		1:   true,
@@ -184,6 +165,9 @@ func ptr[T any](val T) *T {
 }
 
 func (s *Socket) Disconnect() {
+	if s == nil {
+		return
+	}
 	if fn := s.cleanClose.Load(); fn != nil {
 		(*fn)()
 	}
@@ -341,7 +325,13 @@ func (s *Socket) sendData(data []byte) error {
 		return fmt.Errorf("not connected")
 	}
 	err := conn.WriteMessage(websocket.BinaryMessage, data)
-	if err != nil {
+	if exhttp.IsNetworkError(err) {
+		closeErr := conn.Close()
+		if closeErr != nil && !errors.Is(err, net.ErrClosed) {
+			s.client.Logger.Debug().Err(closeErr).Msg("Error closing connection after network error")
+		}
+		return errors.Join(err, closeErr)
+	} else if err != nil {
 		return fmt.Errorf("failed to write to websocket: %w", err)
 	}
 	return nil
@@ -465,5 +455,8 @@ func (s *Socket) getConnHeaders() http.Header {
 }
 
 func (s *Socket) getConnectionType() string {
-	return connectionTypes[s.client.Platform]
+	if s.client.Platform.IsInstagram() {
+		return "cookie_auth"
+	}
+	return "websocket"
 }

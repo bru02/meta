@@ -12,6 +12,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/event"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
@@ -78,6 +79,7 @@ func (m *MetaClient) e2eeEventHandler(rawEvt any) bool {
 		m.UserLogin.BridgeState.Send(m.waState)
 	case *events.Disconnected:
 		log.Debug().Msg("Disconnected from WhatsApp socket")
+		m.e2eeConnectWaiter.Clear()
 		m.waState = status.BridgeState{
 			StateEvent: status.StateTransientDisconnect,
 			Error:      WADisconnected,
@@ -98,7 +100,6 @@ func (m *MetaClient) e2eeEventHandler(rawEvt any) bool {
 		if m.canReconnect() {
 			go m.FullReconnect()
 		}
-		//go m.sendMarkdownBridgeAlert(context.TODO(), "Error in WhatsApp connection: %s", evt.PermanentDisconnectDescription())
 	case events.PermanentDisconnect:
 		switch e := evt.(type) {
 		case *events.LoggedOut:
@@ -133,7 +134,40 @@ func (m *MetaClient) e2eeEventHandler(rawEvt any) bool {
 			Message:    evt.PermanentDisconnectDescription(),
 		}
 		m.UserLogin.BridgeState.Send(m.waState)
-		//go m.sendMarkdownBridgeAlert(context.TODO(), "Error in WhatsApp connection: %s", evt.PermanentDisconnectDescription())
+	case *events.GroupInfo:
+		portalKey := m.makeWAPortalKey(evt.JID)
+		memberChanges := &bridgev2.ChatMemberList{
+			MemberMap: make(map[networkid.UserID]bridgev2.ChatMember),
+		}
+		for _, userID := range evt.Join {
+			memberChanges.MemberMap.Set(bridgev2.ChatMember{
+				EventSender: m.makeWAEventSender(userID),
+				Membership:  event.MembershipJoin,
+			})
+		}
+		for _, userID := range evt.Leave {
+			memberChanges.MemberMap.Set(bridgev2.ChatMember{
+				EventSender:    m.makeWAEventSender(userID),
+				Membership:     event.MembershipLeave,
+				PrevMembership: event.MembershipJoin,
+			})
+		}
+		if len(memberChanges.MemberMap) > 0 {
+			eventMeta := simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatInfoChange,
+				PortalKey: portalKey,
+				Timestamp: evt.Timestamp,
+			}
+			if evt.Sender != nil {
+				eventMeta.Sender = m.makeWAEventSender(*evt.Sender)
+			}
+			m.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+				EventMeta: eventMeta,
+				ChatInfoChange: &bridgev2.ChatInfoChange{
+					MemberChanges: memberChanges,
+				},
+			})
+		}
 	default:
 		log.Debug().Type("event_type", rawEvt).Msg("Unhandled WhatsApp event")
 	}

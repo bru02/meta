@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -35,6 +36,8 @@ var (
 	_ bridgev2.ChatViewingNetworkAPI         = (*MetaClient)(nil)
 	_ bridgev2.TypingHandlingNetworkAPI      = (*MetaClient)(nil)
 	_ bridgev2.DeleteChatHandlingNetworkAPI  = (*MetaClient)(nil)
+	_ bridgev2.RoomNameHandlingNetworkAPI    = (*MetaClient)(nil)
+	_ bridgev2.RoomAvatarHandlingNetworkAPI  = (*MetaClient)(nil)
 )
 
 var _ bridgev2.TransactionIDGeneratingNetwork = (*MetaConnector)(nil)
@@ -371,6 +374,18 @@ func (m *MetaClient) HandleMatrixEdit(ctx context.Context, edit *bridgev2.Matrix
 
 		newEditCount := int64(edit.EditTarget.EditCount) + 1
 
+		// This channel will receive any extra edit responses we receive that AREN'T listed
+		// as responses for the edit request we are about to submit. Sometimes you submit a
+		// request ID for an edit and you get a response for that request ID indicating your
+		// edit was reverted, but it actually wasn't, and you get a subsequent message, not
+		// associated with your request ID, telling you that the edit was successful. So in
+		// case the normal response is bad, we have to wait a bit to see if there is a
+		// follow-up response that corrects it. AFAICT, there is no way to look at the
+		// initial response and tell if it is real or fake. ^_^
+		cursedExtraEdits := make(chan *FBEditEvent, 5)
+		m.editChannels.Set(editTask.MessageID, cursedExtraEdits)
+		defer m.editChannels.Delete(editTask.MessageID)
+
 		var resp *table.LSTable
 		resp, err = m.Client.ExecuteTasks(ctx, editTask)
 		log.Trace().Any("response", resp).Msg("Meta edit response")
@@ -378,23 +393,52 @@ func (m *MetaClient) HandleMatrixEdit(ctx context.Context, edit *bridgev2.Matrix
 			return fmt.Errorf("failed to send edit to Meta: %w", err)
 		}
 
-		if len(resp.LSEditMessage) > 0 {
-			edit.EditTarget.EditCount = int(resp.LSEditMessage[0].EditCount)
-		}
-
 		if len(resp.LSEditMessage) == 0 {
 			log.Debug().Msg("Edit response didn't contain new edit?")
-		} else if resp.LSEditMessage[0].MessageID != editTask.MessageID {
+			return nil
+		}
+		editMsg := resp.LSEditMessage[0]
+
+		if editMsg.MessageID != editTask.MessageID {
 			log.Debug().Msg("Edit response contained different message ID")
-		} else if resp.LSEditMessage[0].Text != editTask.Text {
-			log.Warn().Msg("Server returned edit with different text")
-			return fmt.Errorf("edit reverted")
-		} else if resp.LSEditMessage[0].EditCount != newEditCount {
+			return nil
+		}
+
+		if editMsg.Text != editTask.Text {
+			log.Warn().Msg("Server returned edit with different text, waiting to see if this is corrected")
+			// Wait at most 5 seconds for a success acknowledgment to show up. It
+			// usually shows up after around 100ms, but in case of network delays, it
+			// could be longer. Abort immediately in case we do receive a success
+			// acknowledgment, so that the delay only occurs in the rare case that an
+			// edit actually is rejected.
+			after := time.After(5 * time.Second)
+		loop:
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-after:
+					log.Warn().Msg("Timed out waiting for edit correction, edit was actually rejected")
+					return fmt.Errorf("edit reverted")
+				case newEditMsg := <-cursedExtraEdits:
+					if newEditMsg.Text == editTask.Text {
+						log.Info().Msg("Server accepted edit after previously rejecting it")
+						editMsg = newEditMsg.LSEditMessage
+						break loop
+					} else {
+						log.Warn().Msg("Server returned another edit with different text, continuing to wait")
+					}
+				}
+			}
+		}
+
+		if editMsg.EditCount != newEditCount {
 			log.Warn().
 				Int64("expected_edit_count", newEditCount).
 				Int64("actual_edit_count", resp.LSEditMessage[0].EditCount).
 				Msg("Edit count mismatch")
 		}
+		edit.EditTarget.EditCount = int(editMsg.EditCount)
 
 		return nil
 	case metaid.ParsedWAMessageID:
@@ -610,9 +654,9 @@ func (t *MetaClient) HandleMatrixDeleteChat(ctx context.Context, chat *bridgev2.
 		Bool("is_whatsapp_e2ee", portalMeta.ThreadType.IsWhatsApp()).
 		Msg("Deleting chat")
 
-	if platform == types.Instagram {
+	if platform.IsInstagram() {
 		return t.Client.Instagram.DeleteThread(ctx, strconv.FormatInt(threadID, 10))
-	} else if platform == types.Facebook || platform == types.Messenger {
+	} else if platform.IsMessenger() {
 		_, err := t.Client.ExecuteTasks(ctx, &socket.DeleteThreadTask{
 			ThreadKey:  threadID,
 			RemoveType: 0,
@@ -634,4 +678,141 @@ func (t *MetaClient) HandleMatrixDeleteChat(ctx context.Context, chat *bridgev2.
 		return nil
 	}
 	return fmt.Errorf("unknown platform for deleting chat: %v", platform)
+}
+
+func (m *MetaClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.MatrixRoomName) (bool, error) {
+	if msg.Portal.RoomType == database.RoomTypeDM {
+		return false, fmt.Errorf("renaming not supported in DMs")
+	}
+	platform := m.LoginMeta.Platform
+	threadID := metaid.ParseFBPortalID(msg.Portal.ID)
+	if platform == types.Instagram {
+		err := m.Client.Instagram.EditGroupTitle(ctx, strconv.FormatInt(threadID, 10), msg.Content.Name)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	} else if platform.IsMessenger() {
+		_, err := m.Client.ExecuteTasks(ctx, &socket.RenameThreadTask{
+			ThreadKey:  threadID,
+			ThreadName: msg.Content.Name,
+			SyncGroup:  1,
+		})
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("unknown platform for renaming chat: %v", platform)
+}
+
+func (m *MetaClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.MatrixRoomAvatar) (bool, error) {
+	if msg.Portal.RoomType == database.RoomTypeDM {
+		return false, fmt.Errorf("changing avatar not supported in DMs")
+	}
+	if m.LoginMeta.Platform == types.Instagram {
+		// TODO: implement Instagram avatar changing. IG Web doesn't support this.
+		return false, fmt.Errorf("changing avatar not supported on Instagram")
+	}
+	threadID := metaid.ParseFBPortalID(msg.Portal.ID)
+	var imageID int64
+	if msg.Content.URL == "" {
+		// TODO: handle removing avatar. Messenger web doesn't have a remove option?
+		return false, fmt.Errorf("removing avatar not implemented")
+	} else {
+		data, err := m.Main.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, nil)
+		if err != nil {
+			return false, fmt.Errorf("failed to download avatar: %w", err)
+		}
+		mimeType := http.DetectContentType(data)
+		resp, err := m.Client.SendMercuryUploadRequest(ctx, threadID, &messagix.MercuryUploadMedia{
+			Filename:  "avatar.jpg",
+			MimeType:  mimeType,
+			MediaData: data,
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to upload avatar: %w", err)
+		}
+
+		imageID = resp.Payload.RealMetadata.GetFbId()
+		if imageID == 0 {
+			return false, fmt.Errorf("no image ID received from upload")
+		}
+	}
+	_, err := m.Client.ExecuteTasks(ctx, &socket.SetThreadImageTask{
+		ThreadKey: threadID,
+		ImageID:   imageID,
+		SyncGroup: 1,
+	})
+	if err != nil {
+		return false, err
+	}
+	// TODO update portal metadata
+	return true, nil
+}
+
+func (m *MetaClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
+	if msg.Portal.RoomType == database.RoomTypeDM {
+		return nil, errors.New("cannot change members for DM")
+	}
+
+	var targetID int64
+	switch target := msg.Target.(type) {
+	case *bridgev2.Ghost:
+		targetID = metaid.ParseUserID(target.ID)
+	case *bridgev2.UserLogin:
+		targetID = metaid.ParseUserLoginID(target.ID)
+	default:
+		return nil, fmt.Errorf("unknown membership target type %T", target)
+	}
+	if targetID == 0 {
+		return nil, fmt.Errorf("invalid target user ID")
+	}
+
+	portalMeta := msg.Portal.Metadata.(*metaid.PortalMetadata)
+	if portalMeta.ThreadType == table.ENCRYPTED_OVER_WA_GROUP {
+		portalJID := portalMeta.JID(msg.Portal.ID)
+		targetJID := waTypes.NewJID(strconv.FormatInt(targetID, 10), waTypes.MessengerServer)
+		var action whatsmeow.ParticipantChange
+		switch msg.Type {
+		case bridgev2.Invite:
+			action = whatsmeow.ParticipantChangeAdd
+		case bridgev2.Kick:
+			action = whatsmeow.ParticipantChangeRemove
+		default:
+			return nil, nil
+		}
+		resp, err := m.E2EEClient.UpdateGroupParticipants(ctx, portalJID, []waTypes.JID{targetJID}, action)
+		if err != nil {
+			return nil, err
+		} else if len(resp) == 0 {
+			return nil, fmt.Errorf("no response for participant change")
+		} else if resp[0].Error != 0 {
+			return nil, fmt.Errorf("failed to change participant: code %d", resp[0].Error)
+		}
+		return &bridgev2.MatrixMembershipResult{RedirectTo: metaid.MakeWAUserID(resp[0].JID)}, nil
+	}
+
+	threadID := metaid.ParseFBPortalID(msg.Portal.ID)
+	var task socket.Task
+	switch msg.Type {
+	case bridgev2.Invite:
+		task = &socket.AddParticipantsTask{
+			ThreadKey:  threadID,
+			ContactIDs: []int64{targetID},
+			SyncGroup:  1,
+		}
+	case bridgev2.Kick:
+		task = &socket.RemoveParticipantTask{
+			ThreadID:  threadID,
+			ContactID: targetID,
+		}
+	default:
+		return nil, nil
+	}
+	_, err := m.Client.ExecuteTasks(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	return &bridgev2.MatrixMembershipResult{}, nil
 }

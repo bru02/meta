@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,6 +28,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exerrors"
+	"go.mau.fi/util/exhttp"
 	"go.mau.fi/whatsmeow"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
@@ -36,21 +36,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 )
 
-var mediaHTTPClient = http.Client{
-	Transport: &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		ForceAttemptHTTP2:     true,
-	},
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if req.URL.Hostname() == "video.xx.fbcdn.net" {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	},
-	Timeout: 120 * time.Second,
-}
+var mediaHTTPClient *http.Client
 var BypassOnionForMedia bool
 
 func SetProxy(proxy string) {
@@ -58,8 +44,24 @@ func SetProxy(proxy string) {
 	mediaHTTPClient.Transport.(*http.Transport).Proxy = http.ProxyURL(parsedURL)
 }
 
+func SetHTTP(settings exhttp.ClientSettings) {
+	oldClient := mediaHTTPClient
+	mediaHTTPClient = settings.WithGlobalTimeout(5 * time.Minute).Compile()
+	mediaHTTPClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Hostname() == "video.xx.fbcdn.net" {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+	if oldClient != nil {
+		oldClient.CloseIdleConnections()
+	}
+}
+
 var ErrTooLargeFile = bridgev2.WrapErrorInStatus(errors.New("too large file")).
 	WithErrorAsMessage().WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
+
+var ErrForbidden = errors.New("http forbidden")
 
 func addDownloadHeaders(hdr http.Header, mime string) {
 	hdr.Set("Accept", "*/*")
@@ -119,6 +121,9 @@ func downloadMedia(ctx context.Context, mime, url string, maxSize int64, byteRan
 			if loc != nil && loc.Hostname() == "video.xx.fbcdn.net" {
 				return downloadChunkedVideo(ctx, mime, loc.String(), maxSize)
 			}
+		}
+		if resp.StatusCode == 403 {
+			return 0, nil, ErrForbidden
 		}
 		return 0, nil, fmt.Errorf("unexpected status code %d", resp.StatusCode)
 	} else if resp.ContentLength > maxSize {
@@ -203,8 +208,21 @@ func downloadChunkedVideo(ctx context.Context, mime, url string, maxSize int64) 
 }
 
 type DirectMediaMeta struct {
-	MimeType string `json:"mime_type"`
-	URL      string `json:"url"`
+	MimeType  string `json:"mime_type"`
+	URL       string `json:"url"`
+	ExpiresAt int64  `json:"expires_at,omitempty"` // Unix ms timestamp
+
+	// For blob attachments (message re-fetch):
+	AttachmentFbid string `json:"attachment_fbid,omitempty"`
+	PartIndex      int    `json:"part_index,omitempty"`
+
+	// For XMA attachments (Instagram API refresh):
+	XMATargetID  int64  `json:"xma_target_id,omitempty"`
+	XMAShortcode string `json:"xma_shortcode,omitempty"`
+
+	// For XMA story attachments (parsed from action URL):
+	StoryMediaID string `json:"story_media_id,omitempty"` // story pk
+	StoryReelID  string `json:"story_reel_id,omitempty"`  // user pk (for /stories/direct/ type)
 }
 
 type DirectMediaWhatsApp struct {
