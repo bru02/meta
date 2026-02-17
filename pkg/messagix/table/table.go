@@ -1,6 +1,8 @@
 package table
 
 import (
+	"reflect"
+
 	badGlobalLog "github.com/rs/zerolog/log"
 )
 
@@ -31,7 +33,7 @@ type LSTable struct {
 	LSInsertNewMessageRange                          []*LSInsertNewMessageRange                          `json:",omitempty"`
 	LSUpdateExistingMessageRange                     []*LSUpdateExistingMessageRange                     `json:",omitempty"`
 	LSDeleteExistingMessageRanges                    []*LSDeleteExistingMessageRanges                    `json:",omitempty"`
-	LSUpsertSequenceID                               []*LSUpsertSequenceID                               `json:",omitempty"`
+	LSUpsertSequenceId                               []*LSUpsertSequenceID                               `json:",omitempty"`
 	LSVerifyContactRowExists                         []*LSVerifyContactRowExists                         `json:",omitempty"`
 	LSThreadsRangesQuery                             []*LSThreadsRangesQuery                             `json:",omitempty"`
 	LSSetRegionHint                                  []*LSSetRegionHint                                  `json:",omitempty"`
@@ -155,6 +157,20 @@ type LSTable struct {
 	LSSetNumUnreadSubthreads                         []*LSSetNumUnreadSubthreads                         `json:",omitempty"`
 }
 
+func (t *LSTable) NonNilFields() (fields []string) {
+	if t == nil {
+		return
+	}
+	reflectedTable := reflect.ValueOf(t).Elem()
+	for _, field := range reflect.VisibleFields(reflectedTable.Type()) {
+		if reflectedTable.FieldByName(field.Name).IsNil() {
+			continue
+		}
+		fields = append(fields, field.Name)
+	}
+	return
+}
+
 // TODO replace SPTable with struct tags
 
 var SPTable = map[string]string{
@@ -233,7 +249,7 @@ var SPTable = map[string]string{
 	"handleRepliesOnUnsend":                          "LSHandleRepliesOnUnsend",
 	"deleteExistingMessageRanges":                    "LSDeleteExistingMessageRanges",
 	"writeThreadCapabilities":                        "LSWriteThreadCapabilities",
-	"upsertSequenceId":                               "LSUpsertSequenceID",
+	"upsertSequenceId":                               "LSUpsertSequenceId",
 	"executeFinallyBlockForSyncTransaction":          "LSExecuteFinallyBlockForSyncTransaction",
 	"verifyContactRowExists":                         "LSVerifyContactRowExists",
 	"taskExists":                                     "LSTaskExists",
